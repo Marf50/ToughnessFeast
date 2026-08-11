@@ -427,38 +427,20 @@ static int LektorAppendPair(lektor<StringPair>* dats, const char* left, const ch
     (void)dats; (void)left; (void)right;
     return 0;
 #else
-    if (!dats) return 0;
+    if (!dats || !dats->stuff) return 0;
+    if (dats->maxSize == 0) return 0;
     ResolveStringPairCtor();
     if (!g_spCtor) return 0;
 
     static const size_t kGameStringPairSize = 0x60;
 
-    // Grow capacity if full (tooltip lektors are often exactly full after vanilla lines)
-    if (!dats->stuff || dats->count >= dats->maxSize)
+    // NEVER realloc stuff (game owns the buffer / frees it). If full, drop
+    // the last vanilla line to make one slot — safe for tooltip lifetime.
+    if (dats->count >= dats->maxSize)
     {
-        uint32_t oldMax = dats->maxSize;
-        uint32_t oldCount = dats->count;
-        uint32_t newMax = oldMax + 16;
-        if (newMax < 16) newMax = 16;
-        if (newMax < oldCount + 8) newMax = oldCount + 8;
-        // Cap growth to avoid runaway
-        if (newMax > 64) newMax = 64;
-        if (oldCount >= newMax) return 0;
-
-        void* neu = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                              (SIZE_T)newMax * kGameStringPairSize);
-        if (!neu) return 0;
-        if (dats->stuff && oldCount > 0)
-        {
-            size_t copyN = (size_t)oldCount * kGameStringPairSize;
-            std::memcpy(neu, dats->stuff, copyN);
-        }
-        // Intentionally do not free old buffer — may be stack or game-owned.
-        dats->stuff = (StringPair*)neu;
-        dats->maxSize = newMax;
+        if (dats->maxSize < 1) return 0;
+        dats->count = dats->maxSize - 1;
     }
-
-    if (dats->count >= dats->maxSize) return 0;
 
     GameStr a, b;
     GameStrSet(&a, left ? left : "");
@@ -688,7 +670,7 @@ static void AppendToughnessTooltips(lektor<StringPair>* dats, CharStats* stats)
         char r[64];
         std::snprintf(r, sizeof(r), "~%.1f%% bar / sec", foodUse);
         LektorAppendPair(dats, "Food use while healing", r);
-        LektorAppendPair(dats, "Tip", "Hover limbs for stage");
+        LektorAppendPair(dats, "Tip", "Hover body-part bars");
     }
     else
     {
@@ -738,10 +720,10 @@ static void AppendHungerTooltips(lektor<StringPair>* dats, CharStats* stats)
         {
             char r[64];
             if (active <= 0) std::snprintf(r, sizeof(r), "none");
-            else std::snprintf(r, sizeof(r), "%d regrowing", active);
+            else std::snprintf(r, sizeof(r), "%d arms/legs", active);
             LektorAppendPair(dats, "Limbs healing", r);
         }
-        LektorAppendPair(dats, "Tip", "Hover limb bars for stage");
+        LektorAppendPair(dats, "Tip", "Hover body-part bars");
     }
 }
 
@@ -749,8 +731,8 @@ static void AppendHungerTooltips(lektor<StringPair>* dats, CharStats* stats)
 static CharStats* g_lastStats = nullptr;
 
 // ---------------------------------------------------------------------------
-// Limb HUD tooltips — ToolTip::setup(lektor) after vanilla builds limb lines
-// RVA 0x920AB0 setup(Widget*, lektor const&), addLine RVA 0x920ED0
+// Body-part bars (Left Arm, Chest, Head, Blood, …) — ToolTip::setup(lektor)
+// Append into the game's list BEFORE setup paints. No buffer realloc, no addLine.
 // ---------------------------------------------------------------------------
 
 static void* GameBase()
@@ -777,22 +759,38 @@ static const char* ReadGameStrPtr(const void* strObj)
     size_t size = 0, res = 0;
     std::memcpy(&size, p + 16, sizeof(size));
     std::memcpy(&res, p + 24, sizeof(res));
-    if (size == 0 || size > 256) return "";
-    if (res > 0x100000u) return "";
+    if (size == 0 || size > 200) return "";
+    if (res > 0x200000u) return "";
     const char* data = nullptr;
     if (res < 16u)
         data = (const char*)p;
     else
         std::memcpy(&data, p, sizeof(data));
-    return data ? data : "";
+    if (!data) return "";
+    unsigned char c0 = (unsigned char)data[0];
+    if (c0 < 32 || c0 > 126) return "";
+    return data;
 }
 
-static int DetectLimbSlotFromText(const char* text)
+enum BodyPartKind
 {
-    if (!text || !text[0]) return -1;
-    char buf[128];
+    BP_UNKNOWN = -1,
+    BP_LEFT_ARM = 0,
+    BP_RIGHT_ARM = 1,
+    BP_LEFT_LEG = 2,
+    BP_RIGHT_LEG = 3,
+    BP_CHEST = 4,
+    BP_STOMACH = 5,
+    BP_HEAD = 6,
+    BP_BLOOD = 7
+};
+
+static BodyPartKind DetectBodyPartFromText(const char* text)
+{
+    if (!text || !text[0]) return BP_UNKNOWN;
+    char buf[160];
     size_t n = 0;
-    while (text[n] && n < 127)
+    while (text[n] && n < 159)
     {
         char c = text[n];
         if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
@@ -800,146 +798,186 @@ static int DetectLimbSlotFromText(const char* text)
     }
     buf[n] = 0;
 
-    int isLeft = (std::strstr(buf, "left") != nullptr) || (std::strstr(buf, "l.") != nullptr)
-              || (std::strstr(buf, "l arm") != nullptr) || (std::strstr(buf, "l leg") != nullptr);
-    int isRight = (std::strstr(buf, "right") != nullptr) || (std::strstr(buf, "r.") != nullptr)
-               || (std::strstr(buf, "r arm") != nullptr) || (std::strstr(buf, "r leg") != nullptr);
+    if (std::strstr(buf, "blood")) return BP_BLOOD;
+    if (std::strstr(buf, "head") || std::strstr(buf, "skull")) return BP_HEAD;
+    if (std::strstr(buf, "chest") || std::strstr(buf, "torso") || std::strstr(buf, "rib")) return BP_CHEST;
+    if (std::strstr(buf, "stomach") || std::strstr(buf, "abdomen") || std::strstr(buf, "gut")) return BP_STOMACH;
+
+    int isLeft = (std::strstr(buf, "left") != nullptr) || (std::strstr(buf, "l.") != nullptr);
+    int isRight = (std::strstr(buf, "right") != nullptr) || (std::strstr(buf, "r.") != nullptr);
     int isArm = (std::strstr(buf, "arm") != nullptr);
     int isLeg = (std::strstr(buf, "leg") != nullptr);
 
-    // "left arm" / "right leg" etc.
-    if (isArm && isLeft) return 0;
-    if (isArm && isRight) return 1;
-    if (isLeg && isLeft) return 2;
-    if (isLeg && isRight) return 3;
-
-    // Kenshi sometimes "Arm (L)" style
-    if (isArm && !isRight && std::strstr(buf, "(l)")) return 0;
-    if (isArm && std::strstr(buf, "(r)")) return 1;
-    if (isLeg && !isRight && std::strstr(buf, "(l)")) return 2;
-    if (isLeg && std::strstr(buf, "(r)")) return 3;
-
-    return -1;
+    if (isArm && isLeft) return BP_LEFT_ARM;
+    if (isArm && isRight) return BP_RIGHT_ARM;
+    if (isLeg && isLeft) return BP_LEFT_LEG;
+    if (isLeg && isRight) return BP_RIGHT_LEG;
+    if (isArm && std::strstr(buf, "(l)")) return BP_LEFT_ARM;
+    if (isArm && std::strstr(buf, "(r)")) return BP_RIGHT_ARM;
+    if (isLeg && std::strstr(buf, "(l)")) return BP_LEFT_LEG;
+    if (isLeg && std::strstr(buf, "(r)")) return BP_RIGHT_LEG;
+    return BP_UNKNOWN;
 }
 
-static int DetectLimbSlotFromLektor(const lektor<StringPair>* lines)
+static BodyPartKind DetectBodyPartFromLektor(const lektor<StringPair>* lines)
 {
-    if (!lines || !lines->stuff || lines->count == 0) return -1;
+    if (!lines || !lines->stuff || lines->count == 0 || lines->count > 64)
+        return BP_UNKNOWN;
     static const size_t kPair = 0x60;
     unsigned n = lines->count;
-    if (n > 32) n = 32;
+    if (n > 24) n = 24;
     for (unsigned i = 0; i < n; ++i)
     {
         const char* base = (const char*)(void*)lines->stuff + (size_t)i * kPair;
-        // s1 @ +0x8, s2 @ +0x30 (KenshiLib StringPair layout)
-        int s = DetectLimbSlotFromText(ReadGameStrPtr(base + 0x8));
-        if (s >= 0) return s;
-        s = DetectLimbSlotFromText(ReadGameStrPtr(base + 0x30));
-        if (s >= 0) return s;
+        BodyPartKind k = DetectBodyPartFromText(ReadGameStrPtr(base + 0x8));
+        if (k != BP_UNKNOWN) return k;
+        k = DetectBodyPartFromText(ReadGameStrPtr(base + 0x30));
+        if (k != BP_UNKNOWN) return k;
     }
-    return -1;
+    return BP_UNKNOWN;
 }
 
-// ToolTip::addLine(string const&, string const&)
-typedef void (*ToolTipAddLineFn)(void* self, const GameStr* left, const GameStr* right);
-static ToolTipAddLineFn g_tipAddLine = nullptr;
-
-static void TipAddLine(void* tip, const char* left, const char* right)
+static void AppendBodyPartTooltipLines(lektor<StringPair>* lines, CharStats* stats, BodyPartKind kind)
 {
-#if defined(TOUGHNESSFEAST_LINUX_IDE)
-    (void)tip; (void)left; (void)right;
-#else
-    if (!tip) return;
-    if (!g_tipAddLine)
+    if (!lines || !stats) return;
+
+    // Need several free/trimmable slots
+    if (lines->maxSize < 4) return;
+
+    float pwr = RegenPowerOf(stats);
+    MedicalSystem* med = stats->medical;
+
+    LektorAppendPair(lines, "--- Toughness Feast ---", "-");
+
+    if (kind == BP_BLOOD)
     {
-        void* base = GameBase();
-        if (!base) return;
-        g_tipAddLine = (ToolTipAddLineFn)((unsigned char*)base + 0x920ED0);
+        if (med)
+        {
+            char r[64];
+            // MedicalSystem::blood @ 0x70
+            float b = 0.f;
+            std::memcpy(&b, (const char*)(void*)med + 0x70, sizeof(float));
+            if (b != b || b < 0.f) b = 0.f;
+            if (b > 5.f) b = 5.f;
+            std::snprintf(r, sizeof(r), "%.0f%%", b * 100.f);
+            LektorAppendPair(lines, "Blood", r);
+        }
+        LektorAppendPair(lines, "TF note", "Not regrown by TF");
+        return;
     }
-    if (!g_tipAddLine) return;
-    GameStr a, b;
-    GameStrSet(&a, left ? left : "");
-    GameStrSet(&b, right ? right : "");
-    g_tipAddLine(tip, &a, &b);
-#endif
-}
 
-static void AppendOneLimbOntoToolTip(void* tip, CharStats* stats, int slot)
-{
-    if (!tip || !stats || slot < 0 || slot > 3) return;
-    LimbTip limbs[4];
-    int n = CollectLimbTips(stats, limbs, 4);
-    if (slot >= n) return;
-
-    const LimbTip& L = limbs[slot];
-    TipAddLine(tip, "--- Toughness Feast ---", "");
-    TipAddLine(tip, "Regrow stage", L.stage);
-    TipAddLine(tip, "Progress", L.detail);
+    if (kind >= BP_LEFT_ARM && kind <= BP_RIGHT_LEG)
     {
-        float pwr = RegenPowerOf(stats);
+        LimbTip tips[4];
+        int n = CollectLimbTips(stats, tips, 4);
+        int slot = (int)kind;
+        if (slot < n)
+        {
+            LektorAppendPair(lines, "Regrow stage", tips[slot].stage);
+            LektorAppendPair(lines, "Progress", tips[slot].detail);
+            if (pwr <= 0.f)
+                LektorAppendPair(lines, "Food regen", "Locked");
+            else if (tips[slot].active)
+            {
+                char r[64];
+                std::snprintf(r, sizeof(r), "Healing pwr %.1f", pwr);
+                LektorAppendPair(lines, "Food regen", r);
+                char r2[64];
+                std::snprintf(r2, sizeof(r2), "~%.1f%%/sec", FoodUsePercentPerSec(stats));
+                LektorAppendPair(lines, "Food cost", r2);
+            }
+            else
+                LektorAppendPair(lines, "Food regen", "Idle - OK");
+        }
+        return;
+    }
+
+    // Chest / stomach / head — flesh heal status
+    const char* label =
+        (kind == BP_HEAD) ? "Head" :
+        (kind == BP_STOMACH) ? "Stomach" :
+        (kind == BP_CHEST) ? "Chest" : "Part";
+
+    MedicalSystem::HealthPartStatus* part = nullptr;
+    if (med)
+    {
+        int count = med->getPartCount();
+        if (count < 0) count = 0;
+        if (count > 32) count = 32;
+        for (int i = 0; i < count; ++i)
+        {
+            MedicalSystem::HealthPartStatus* hp = med->getPart((unsigned long long)i);
+            if (!hp || hp->isRobotic()) continue;
+            // Match by GameData name at known offsets (raw)
+            // data pointer is first member of HealthPartStatus
+            void* gd = nullptr;
+            std::memcpy(&gd, hp, sizeof(gd)); // data @ 0x0
+            if (!gd) continue;
+            BodyPartKind kn = DetectBodyPartFromText(ReadGameStrPtr((const char*)gd + 0x28));
+            if (kn == BP_UNKNOWN)
+                kn = DetectBodyPartFromText(ReadGameStrPtr((const char*)gd + 0x58));
+            if (kn == kind) { part = hp; break; }
+            // head/torso fallback via PartType int at 0x8
+            int ptype = 0;
+            std::memcpy(&ptype, (const char*)(void*)hp + 0x8, sizeof(int));
+            // PART_TORSO=0, PART_LEG=1, PART_ARM=2, PART_HEAD=3
+            if (kind == BP_HEAD && ptype == 3) { part = hp; break; }
+            if (kind == BP_CHEST && ptype == 0) { part = hp; break; }
+        }
+    }
+
+    if (part)
+    {
+        float maxHp = part->maxHealth();
+        if (maxHp < 1.f) maxHp = part->_maxHealth;
+        if (maxHp < 1.f) maxHp = 100.f;
+        float flesh = part->flesh;
+        if (flesh != flesh || flesh < 0.f) flesh = 0.f;
         char r[64];
-        if (pwr <= 0.f)
-            std::snprintf(r, sizeof(r), "Locked (need toughness)");
-        else if (L.active)
-            std::snprintf(r, sizeof(r), "Healing via food (pwr %.1f)", pwr);
-        else
-            std::snprintf(r, sizeof(r), "Idle (limb OK)");
-        TipAddLine(tip, "Food regen", r);
+        std::snprintf(r, sizeof(r), "HP %.0f%%", (flesh / maxHp) * 100.f);
+        LektorAppendPair(lines, label, r);
+        if (part->fleshStun > 0.f && part->fleshStun < 1e6f)
+        {
+            char r2[64];
+            std::snprintf(r2, sizeof(r2), "%.0f", part->fleshStun);
+            LektorAppendPair(lines, "Stun", r2);
+        }
     }
-    if (L.active)
+    else
+        LektorAppendPair(lines, label, "status n/a");
+
+    if (pwr <= 0.f)
+        LektorAppendPair(lines, "Food heal", "Locked");
+    else
     {
-        float foodUse = FoodUsePercentPerSec(stats);
         char r[64];
-        std::snprintf(r, sizeof(r), "~%.1f%% bar/sec if healing", foodUse);
-        TipAddLine(tip, "Food cost", r);
+        std::snprintf(r, sizeof(r), "ON pwr %.1f", pwr);
+        LektorAppendPair(lines, "Food heal", r);
     }
 }
 
-// void ToolTip::setup(Widget*, lektor<StringPair> const&)
-static void (*ToolTip_setup_lines_orig)(void* self, void* widget, const lektor<StringPair>* lines) = nullptr;
-static void ToolTip_setup_lines_hook(void* self, void* widget, const lektor<StringPair>* lines)
+// void ToolTip::setup(Widget*, lektor const&) RVA 0x920AB0
+static void (*ToolTip_setup_lines_orig)(void* self, void* widget, lektor<StringPair>* lines) = nullptr;
+static void ToolTip_setup_lines_hook(void* self, void* widget, lektor<StringPair>* lines)
 {
+    if (g_cfg.enableTooltips && lines && g_lastStats && lines->stuff && lines->maxSize > 0)
+    {
+        BodyPartKind kind = DetectBodyPartFromLektor(lines);
+        if (kind != BP_UNKNOWN)
+        {
+            AppendBodyPartTooltipLines(lines, g_lastStats, kind);
+            static int s_once = 0;
+            if (!s_once)
+            {
+                char m[96];
+                std::snprintf(m, sizeof(m), "ToughnessFeast: body-part tip kind=%d", (int)kind);
+                DebugLog(m);
+                s_once = 1;
+            }
+        }
+    }
     if (ToolTip_setup_lines_orig)
         ToolTip_setup_lines_orig(self, widget, lines);
-
-    if (!g_cfg.enableTooltips || !self || !lines) return;
-
-    int slot = DetectLimbSlotFromLektor(lines);
-    if (slot < 0) return;
-
-    CharStats* stats = g_lastStats;
-    if (!stats) return;
-
-    AppendOneLimbOntoToolTip(self, stats, slot);
-
-    static int s_limbTipOnce = 0;
-    if (!s_limbTipOnce)
-    {
-        char m[96];
-        std::snprintf(m, sizeof(m), "ToughnessFeast: limb tooltip slot=%d", slot);
-        DebugLog(m);
-        s_limbTipOnce = 1;
-    }
-}
-
-// void ToolTip::setup(Widget*, GameData*) — body-part GameData name
-static void (*ToolTip_setup_gd_orig)(void* self, void* widget, void* gameData) = nullptr;
-static void ToolTip_setup_gd_hook(void* self, void* widget, void* gameData)
-{
-    if (ToolTip_setup_gd_orig)
-        ToolTip_setup_gd_orig(self, widget, gameData);
-
-    if (!g_cfg.enableTooltips || !self || !gameData) return;
-    CharStats* stats = g_lastStats;
-    if (!stats) return;
-
-    // GameData::name @ 0x28, stringID @ 0x58
-    int slot = DetectLimbSlotFromText(ReadGameStrPtr((const char*)gameData + 0x28));
-    if (slot < 0)
-        slot = DetectLimbSlotFromText(ReadGameStrPtr((const char*)gameData + 0x58));
-    if (slot < 0) return;
-
-    AppendOneLimbOntoToolTip(self, stats, slot);
 }
 
 static int g_statusLogCooldown = 0;
@@ -1537,27 +1575,23 @@ static int HookExport(const char* mangled, void* detour, void** original, const 
     return TryAddHook(real, detour, original, okMsg);
 }
 
-static void InstallLimbToolTipHooks()
+static void InstallBodyPartToolTipHook()
 {
 #if defined(TOUGHNESSFEAST_LINUX_IDE)
     return;
 #else
+    if (!g_cfg.enableTooltips) return;
     void* base = GameBase();
     if (!base)
     {
-        ErrorLog("ToughnessFeast: no game base for ToolTip hooks");
+        ErrorLog("ToughnessFeast: no game base for body-part tips");
         return;
     }
-    // ToolTip::setup(Widget*, lektor const&) RVA 0x920AB0
-    TryAddHook((void*)((unsigned char*)base + 0x920AB0),
+    void* target = (void*)((unsigned char*)base + 0x920AB0);
+    TryAddHook(target,
                (void*)ToolTip_setup_lines_hook,
                (void**)&ToolTip_setup_lines_orig,
-               "ToughnessFeast: hooked limb ToolTip lines");
-    // ToolTip::setup(Widget*, GameData*) RVA 0x91F970
-    TryAddHook((void*)((unsigned char*)base + 0x91F970),
-               (void*)ToolTip_setup_gd_hook,
-               (void**)&ToolTip_setup_gd_orig,
-               "ToughnessFeast: hooked limb ToolTip GameData");
+               "ToughnessFeast: hooked body-part bar tooltips");
 #endif
 }
 
@@ -1597,7 +1631,7 @@ static void InstallHooks()
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
     if (g_cfg.enableTooltips)
     {
-        InstallLimbToolTipHooks();
+        InstallBodyPartToolTipHook();
         // getStatPenaltiesForGUI — toughness (and other stats) hover
         HookExport(
             "?getStatPenaltiesForGUI@CharStats@@QEAA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@W4StatsEnumerated@@AEAV?$lektor@VStringPair@@@@@Z",
