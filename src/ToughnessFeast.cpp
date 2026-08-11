@@ -505,8 +505,8 @@ static float FoodUsePercentPerSec(CharStats* stats)
 
 struct LimbTip
 {
-    char name[12];
-    char stage[24];   // Budding / Strengthening / Healthy...
+    char name[16];
+    char stage[28];   // Budding / Strengthening / Healthy...
     char detail[48];  // progress sentence
     int active;       // needs attention
 };
@@ -521,7 +521,7 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
         RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
         RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
     };
-    static const char* kNames[4] = { "Left arm", "Right arm", "Left leg", "Right leg" };
+    static const char* kNames[4] = { "Left Arm", "Right Arm", "Left Leg", "Right Leg" };
 
     int n = 0;
     for (int i = 0; i < 4 && n < maxOut; ++i)
@@ -553,13 +553,21 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
 
         if (st == LIMB_STUMP || st == LIMB_CRUSHED)
         {
-            float prog = (g_cfg.limbBudThreshold > 0.01f) ? (pct / g_cfg.limbBudThreshold) : 0.f;
+            // Use raw flesh for progress (can be negative like UI "-45")
+            float rawFlesh = part->flesh;
+            float progFlesh = rawFlesh > 0.f ? rawFlesh : 0.f;
+            float prog = (g_cfg.limbBudThreshold > 0.01f && maxHp > 1.f)
+                ? (progFlesh / maxHp) / g_cfg.limbBudThreshold : 0.f;
             if (prog > 1.f) prog = 1.f;
             if (prog < 0.f) prog = 0.f;
             std::snprintf(tip.stage, sizeof(tip.stage), "%s",
-                st == LIMB_CRUSHED ? "Crushed - budding" : "Stump - budding");
-            std::snprintf(tip.detail, sizeof(tip.detail),
-                "Grow %.0f%% to restore", prog * 100.f);
+                st == LIMB_CRUSHED ? "Crushed / budding" : "MISSING / budding");
+            if (rawFlesh < 0.f)
+                std::snprintf(tip.detail, sizeof(tip.detail),
+                    "HP %.0f  bud %.0f%%", rawFlesh, prog * 100.f);
+            else
+                std::snprintf(tip.detail, sizeof(tip.detail),
+                    "bud %.0f%% to restore", prog * 100.f);
             tip.active = 1;
         }
         else if (st == LIMB_REPLACED)
@@ -604,8 +612,8 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
 // Toughness hover: overview only (easy to scan)
 static int g_tooltipOnce = 0;
 
-// All TF info lives here (body-part ToolTip hooks crashed the game).
-// Keep lines short; left/right columns stay readable in Kenshi tooltips.
+// All TF info on food/Hunger hover (matches right-side medical bars: Blood..Hunger).
+// Left panel TOUGHNESS line is not hooked (crashes). Layout mirrors the character sheet.
 static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
 {
     if (!dats || !stats) return;
@@ -636,175 +644,163 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
     int active = 0;
     for (int i = 0; i < nLimbs; ++i) if (limbs[i].active) ++active;
 
-    // ---- header ----
-    LektorAppendPair(dats, "========", "Toughness Feast");
-    // (shown on food/hunger hover — toughness hook crashes)
+    // Header
+    LektorAppendPair(dats, "== Toughness Feast ==", "food tip");
     {
-        char r[64];
+        char r[48];
         const char* race = RaceKindName(rk);
-        char raceCap[32];
-        std::snprintf(raceCap, sizeof(raceCap), "%s", race);
-        if (raceCap[0] >= 'a' && raceCap[0] <= 'z')
-            raceCap[0] = (char)(raceCap[0] - 32);
-        std::snprintf(r, sizeof(r), "%s", raceCap);
+        std::snprintf(r, sizeof(r), "%s", race ? race : "?");
+        if (r[0] >= 'a' && r[0] <= 'z') r[0] = (char)(r[0] - 32);
         LektorAppendPair(dats, "Race", r);
     }
     {
-        char r[64];
-        std::snprintf(r, sizeof(r), "%.0f  (cap %.0f combat)", stats->_toughness, g_cfg.combatCapToughness);
+        char r[48];
+        std::snprintf(r, sizeof(r), "%.0f (combat cap %.0f)", stats->_toughness, g_cfg.combatCapToughness);
         LektorAppendPair(dats, "Toughness", r);
     }
 
-    // ---- food regen unlock ----
-    LektorAppendPair(dats, "---- Food regen ----", "----");
-    {
-        char r[64];
-        if (un >= 9000.f)
-            std::snprintf(r, sizeof(r), "n/a");
-        else
-            std::snprintf(r, sizeof(r), "unlocks at %.0f", un);
-        LektorAppendPair(dats, "Threshold", r);
-    }
+    // Food / Hunger (the bar you hovered)
+    LektorAppendPair(dats, "-- Food regen --", "--");
     if (pwr <= 0.f)
     {
         LektorAppendPair(dats, "Status", "LOCKED");
-        {
-            char r[64];
-            std::snprintf(r, sizeof(r), "need %.0f more tgh", (un > stats->_toughness) ? (un - stats->_toughness) : 0.f);
-            LektorAppendPair(dats, "To unlock", r);
-        }
+        char r[48];
+        std::snprintf(r, sizeof(r), "need %.0f tgh (at %.0f)", un, stats->_toughness);
+        LektorAppendPair(dats, "Unlock", r);
     }
     else
     {
-        {
-            char r[64];
-            std::snprintf(r, sizeof(r), "ACTIVE  pwr %.1f", pwr);
-            LektorAppendPair(dats, "Status", r);
-        }
-        {
-            char r[64];
-            std::snprintf(r, sizeof(r), "~%.1f%% bar / sec", foodUse);
-            LektorAppendPair(dats, "Food use", r);
-        }
+        char r[48];
+        std::snprintf(r, sizeof(r), "ON  pwr %.1f", pwr);
+        LektorAppendPair(dats, "Status", r);
+        std::snprintf(r, sizeof(r), "~%.1f%% / sec", foodUse);
+        LektorAppendPair(dats, "Food drain", r);
         if (hunger >= 0.f)
         {
-            char r[64];
             int fed = hunger >= g_cfg.minHungerToRegen ? 1 : 0;
-            std::snprintf(r, sizeof(r), "%.0f%% %s", hunger * 100.f, fed ? "fed OK" : "TOO HUNGRY");
-            LektorAppendPair(dats, "Fullness", r);
+            std::snprintf(r, sizeof(r), "%.0f%% %s", hunger * 100.f, fed ? "fed OK" : "TOO LOW");
+            LektorAppendPair(dats, "Hunger", r);
         }
     }
 
-    // ---- arms / legs (regrow stages) ----
-    LektorAppendPair(dats, "---- Limbs ----", "stage / progress");
-    if (nLimbs <= 0)
-    {
-        LektorAppendPair(dats, "Limbs", "no data yet");
-    }
-    else
-    {
-        for (int i = 0; i < nLimbs; ++i)
-        {
-            // Name | stage
-            LektorAppendPair(dats, limbs[i].name, limbs[i].stage);
-            // blank-ish key | detail sentence
-            LektorAppendPair(dats, "  ", limbs[i].detail);
-        }
-        {
-            char r[64];
-            if (active <= 0)
-                std::snprintf(r, sizeof(r), "all OK");
-            else
-                std::snprintf(r, sizeof(r), "%d need food heal", active);
-            LektorAppendPair(dats, "Summary", r);
-        }
-    }
-
-    // ---- other body parts (chest/head/etc) brief HP if we can ----
+    // Medical bars order: Blood, Head, Stomach, Chest, Arms, Legs (like the UI)
+    LektorAppendPair(dats, "-- Body bars --", "HP / stage");
     if (med)
     {
-        LektorAppendPair(dats, "---- Body ----", "flesh HP");
+        // Blood @ 0x70
+        {
+            float b = 0.f;
+            std::memcpy(&b, (const char*)(void*)med + 0x70, sizeof(float));
+            if (b != b || b < 0.f) b = 0.f;
+            if (b > 5.f) b = 5.f;
+            char r[48];
+            std::snprintf(r, sizeof(r), "%.0f", b * 100.f);
+            LektorAppendPair(dats, "Blood", r);
+        }
+
+        // Non-limb parts by type: HEAD=3 TORSO=0; stomach via name
         int count = med->getPartCount();
         if (count < 0) count = 0;
         if (count > 32) count = 32;
-
-        int shown = 0;
-        for (int i = 0; i < count && shown < 6; ++i)
+        MedicalSystem::HealthPartStatus* headP = nullptr;
+        MedicalSystem::HealthPartStatus* chestP = nullptr;
+        MedicalSystem::HealthPartStatus* stomachP = nullptr;
+        for (int i = 0; i < count; ++i)
         {
             MedicalSystem::HealthPartStatus* part = med->getPart((unsigned long long)i);
-            if (!part) continue;
-            if (part->isRobotic()) continue;
-
-            // Skip pure limb slots already listed (arm/leg robot enums)
-            LimbState st = part->getRobotLimbState();
-            // Still show stump/crush in body section? Limbs section covers arms/legs.
-            // Identify non-limb by PartType @ +0x8: TORSO=0 HEAD=3; LEG=1 ARM=2
+            if (!part || part->isRobotic()) continue;
             int ptype = 0;
             std::memcpy(&ptype, (const char*)(void*)part + 0x8, sizeof(int));
-            if (ptype == 1 || ptype == 2) continue; // leg/arm already in Limbs
-
-            const char* label = "Part";
-            if (ptype == 0) label = "Torso/chest";
-            else if (ptype == 3) label = "Head";
-            else
+            if (ptype == 3 && !headP) headP = part;
+            else if (ptype == 0 && !chestP) chestP = part;
+            // name scan for stomach
+            void* gd = nullptr;
+            std::memcpy(&gd, part, sizeof(gd));
+            if (gd)
             {
-                // try GameData name
-                void* gd = nullptr;
-                std::memcpy(&gd, part, sizeof(gd));
-                if (gd)
+                const unsigned char* sp = (const unsigned char*)gd + 0x28;
+                size_t sz = 0, res = 0;
+                std::memcpy(&sz, sp + 16, sizeof(sz));
+                std::memcpy(&res, sp + 24, sizeof(res));
+                const char* nm = nullptr;
+                if (sz > 0 && sz < 48 && res < 0x100000u)
                 {
-                    // use first 15 chars of name into static-ish buffer via GameStr path
-                    const unsigned char* sp = (const unsigned char*)gd + 0x28;
-                    size_t sz = 0, res = 0;
-                    std::memcpy(&sz, sp + 16, sizeof(sz));
-                    std::memcpy(&res, sp + 24, sizeof(res));
-                    const char* nm = nullptr;
-                    if (sz > 0 && sz < 40 && res < 0x100000u)
-                    {
-                        if (res < 16u) nm = (const char*)sp;
-                        else std::memcpy(&nm, sp, sizeof(nm));
+                    if (res < 16u) nm = (const char*)sp;
+                    else std::memcpy(&nm, sp, sizeof(nm));
+                }
+                if (nm)
+                {
+                    char buf[32];
+                    size_t n = 0;
+                    while (nm[n] && n < 31) {
+                        char c = nm[n];
+                        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+                        buf[n++] = c;
                     }
-                    if (nm && nm[0] >= 32 && nm[0] < 127)
-                        label = nm; // short-lived ok for snprintf below
+                    buf[n] = 0;
+                    if (std::strstr(buf, "stomach") || std::strstr(buf, "abdomen"))
+                        stomachP = part;
+                    if (std::strstr(buf, "chest") || std::strstr(buf, "torso"))
+                        chestP = part;
+                    if (std::strstr(buf, "head"))
+                        headP = part;
                 }
             }
+        }
 
+        auto emitPart = [&](const char* label, MedicalSystem::HealthPartStatus* part) {
+            if (!part) {
+                LektorAppendPair(dats, label, "n/a");
+                return;
+            }
             float maxHp = part->maxHealth();
             if (maxHp < 1.f) maxHp = part->_maxHealth;
             if (maxHp < 1.f) maxHp = 100.f;
             float flesh = part->flesh;
-            if (flesh != flesh) continue;
-            if (flesh < 0.f) flesh = 0.f;
-            float pct = flesh / maxHp * 100.f;
-
-            char left[48];
-            char right[48];
-            // copy label safely
-            std::snprintf(left, sizeof(left), "%s", label);
-            if (part->fleshStun > 1.f)
-                std::snprintf(right, sizeof(right), "HP %.0f%% stun", pct);
+            if (flesh != flesh) flesh = 0.f;
+            char r[48];
+            // Match UI style: raw HP number like 125 / 52 / -45
+            if (part->fleshStun > 1.f && part->fleshStun < 1e5f)
+                std::snprintf(r, sizeof(r), "%.0f  stun", flesh);
             else
-                std::snprintf(right, sizeof(right), "HP %.0f%%", pct);
-            LektorAppendPair(dats, left, right);
-            ++shown;
-        }
-        if (shown == 0)
-            LektorAppendPair(dats, "Body", "n/a");
+                std::snprintf(r, sizeof(r), "%.0f", flesh);
+            LektorAppendPair(dats, label, r);
+        };
+
+        emitPart("Head", headP);
+        emitPart("Stomach", stomachP);
+        emitPart("Chest", chestP);
     }
 
-    // ---- combat note ----
-    LektorAppendPair(dats, "---- Combat ----", "----");
+    // Arms / legs — same names as the medical bars
+    LektorAppendPair(dats, "-- Arms & Legs --", "TF regrow");
+    if (nLimbs <= 0)
+        LektorAppendPair(dats, "Limbs", "no data");
+    else
     {
-        char r[64];
-        std::snprintf(r, sizeof(r), "soft-cap %.0f tgh", g_cfg.combatCapToughness);
-        LektorAppendPair(dats, "DR / degen", r);
+        for (int i = 0; i < nLimbs; ++i)
+        {
+            LektorAppendPair(dats, limbs[i].name, limbs[i].stage);
+            LektorAppendPair(dats, "  progress", limbs[i].detail);
+        }
+        char r[48];
+        if (active <= 0) std::snprintf(r, sizeof(r), "all OK");
+        else std::snprintf(r, sizeof(r), "%d healing", active);
+        LektorAppendPair(dats, "Summary", r);
+    }
+
+    LektorAppendPair(dats, "-- Combat --", "--");
+    {
+        char r[48];
+        std::snprintf(r, sizeof(r), "DR soft-cap %.0f", g_cfg.combatCapToughness);
+        LektorAppendPair(dats, "Toughness combat", r);
     }
     if (active > 0)
-        LektorAppendPair(dats, "Weak limbs", "fight penalty on");
+        LektorAppendPair(dats, "Weak limbs", "fight penalty ON");
     else
         LektorAppendPair(dats, "Weak limbs", "none");
 
-    LektorAppendPair(dats, "========", "end TF");
+    LektorAppendPair(dats, "== end TF ==", "hover Hunger");
 }
 
 static void AppendHungerTooltips(lektor<StringPair>* dats, CharStats* stats)
