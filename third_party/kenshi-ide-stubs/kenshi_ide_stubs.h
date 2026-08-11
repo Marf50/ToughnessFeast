@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #ifndef MAX_PATH
@@ -37,10 +38,7 @@ inline void DebugLog(const std::string&) {}
 inline void ErrorLog(const char*) {}
 inline void ErrorLog(const std::string&) {}
 
-enum StatsEnumerated
-{
-    STAT_TOUGHNESS = 0
-};
+enum StatsEnumerated { STAT_TOUGHNESS = 0 };
 
 enum LimbState
 {
@@ -56,6 +54,7 @@ class MedicalSystem;
 class GameData;
 class RaceData;
 class Item;
+class DatapanelGUI;
 
 class GameData
 {
@@ -78,28 +77,41 @@ public:
     RaceData* getRace() const { return nullptr; }
 };
 
-class CharStats
+class DataPanelLine
 {
 public:
-    float _toughness = 0.f;
-    float calculateToughnessDamageResistanceMult() { return 1.f; }
-    float calculateToughnessWoundDegenerationRate() { return 1.f; }
-    void xpStat_eventBased(StatsEnumerated, float) {}
-    void xpStat_timeBased(StatsEnumerated) {}
+    void setToolTip(const std::string&) {}
+};
+
+class DatapanelGUI
+{
+public:
+    DataPanelLine* setLine(const std::string&, const std::string&, const std::string&, int, bool, bool)
+    {
+        return nullptr;
+    }
+    DataPanelLine* getLine(const std::string&, int) { return nullptr; }
 };
 
 class RobotLimbs
 {
 public:
-    enum Limb
-    {
-        LEFT_ARM,
-        RIGHT_ARM,
-        LEFT_LEG,
-        RIGHT_LEG,
-        NULL_LIMB
-    };
+    enum Limb { LEFT_ARM, RIGHT_ARM, LEFT_LEG, RIGHT_LEG, NULL_LIMB };
     void setLimb(Limb, LimbState, Item*) {}
+};
+
+class CharStats
+{
+public:
+    float _toughness = 0.f;
+    MedicalSystem* medical = nullptr;
+    Character* me = nullptr;
+    float calculateToughnessDamageResistanceMult() { return 1.f; }
+    float calculateToughnessWoundDegenerationRate() { return 1.f; }
+    void xpStat_eventBased(StatsEnumerated, float) {}
+    void xpStat_timeBased(StatsEnumerated) {}
+    void getGUIData(DatapanelGUI*, int) {}
+    void getGUIDataForMainInfo(DatapanelGUI*, int, bool) {}
 };
 
 class MedicalSystem
@@ -107,13 +119,7 @@ class MedicalSystem
 public:
     struct HealthPartStatus
     {
-        enum PartType
-        {
-            PART_TORSO = 0,
-            PART_HEAD = 1,
-            PART_ARM = 2,
-            PART_LEG = 3
-        };
+        enum PartType { PART_TORSO = 0, PART_HEAD = 1, PART_ARM = 2, PART_LEG = 3 };
         float flesh = 0.f;
         float fleshStun = 0.f;
         float _maxHealth = 100.f;
@@ -141,32 +147,24 @@ public:
     int getPartCount() const { return 0; }
     HealthPartStatus* getPart(unsigned long long) { return nullptr; }
     void medicalUpdate(float) {}
+    void getMedicalGUIData(DatapanelGUI*) {}
 };
 
 namespace KenshiLib
 {
-enum HookStatus
-{
-    SUCCESS = 0,
-    FAIL = 1
-};
-
+enum HookStatus { SUCCESS = 0, FAIL = 1 };
 inline intptr_t GetRealAddress(void*) { return 0; }
-
 template <typename T>
 inline intptr_t GetRealAddress(T fun)
 {
     return GetRealAddress(reinterpret_cast<void*&>(fun));
 }
-
 inline HookStatus AddHook(void*, void*, void**) { return SUCCESS; }
-
 template <typename T>
 inline HookStatus AddHook(intptr_t target, void* detour, T** original)
 {
     return AddHook(reinterpret_cast<void*>(target), detour, reinterpret_cast<void**>(original));
 }
-
 template <typename T1, typename T2>
 inline HookStatus AddHook(T1* target, void* detour, T2** original)
 {
