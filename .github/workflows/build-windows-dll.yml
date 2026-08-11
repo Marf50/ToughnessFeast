@@ -1,0 +1,73 @@
+# Builds ToughnessFeast.dll on a free GitHub-hosted Windows runner.
+# You do NOT need a Windows PC: push this repo → Actions → download the artifact.
+#
+# Trigger: push, or Actions → "Build Windows DLL" → Run workflow
+
+name: Build Windows DLL
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: MSVC x64 Release
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout plugin source
+        uses: actions/checkout@v4
+
+      - name: Install Git LFS
+        run: git lfs install
+
+      - name: Clone KenshiLib deps (with LFS binaries)
+        run: |
+          git clone --depth 1 https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git "${{ runner.temp }}\kenshi_deps"
+          cd "${{ runner.temp }}\kenshi_deps"
+          git lfs pull
+          # Extract Boost 1.60 headers used by KenshiLib includes
+          if (Test-Path "boost_1_60_0\boost.zip") {
+            tar -xf "boost_1_60_0\boost.zip" --directory "boost_1_60_0"
+          }
+          $lib = Get-Item "KenshiLib\Libraries\KenshiLib.lib"
+          if ($lib.Length -lt 10000) {
+            throw "KenshiLib.lib looks like an LFS pointer ($($lib.Length) bytes). git lfs pull failed."
+          }
+          Write-Host "KenshiLib.lib size: $($lib.Length)"
+
+      - name: Configure CMake (MSVC x64)
+        shell: cmd
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
+            -DKENSHILIB_DIR=%RUNNER_TEMP%\kenshi_deps\KenshiLib ^
+            -DBOOST_INCLUDE_DIR=%RUNNER_TEMP%\kenshi_deps\boost_1_60_0 ^
+            -DTOUGHNESSFEAST_FORCE_GAME_BUILD=ON
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Stage mod package
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path build -Recurse -Filter ToughnessFeast.dll | Select-Object -First 1
+          if (-not $dll) { throw "ToughnessFeast.dll not found after build" }
+          Write-Host "Built: $($dll.FullName) ($($dll.Length) bytes)"
+          New-Item -ItemType Directory -Force -Path dist_mod | Out-Null
+          Copy-Item $dll.FullName dist_mod/ToughnessFeast.dll
+          Copy-Item kenshi_mod/config.ini dist_mod/
+          Copy-Item kenshi_mod/RE_Kenshi.json dist_mod/
+          Copy-Item kenshi_mod/ToughnessFeast.mod dist_mod/
+          Get-ChildItem dist_mod | Format-Table Name, Length
+
+      - name: Upload DLL + mod folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: ToughnessFeast-mod
+          path: dist_mod/
+          if-no-files-found: error

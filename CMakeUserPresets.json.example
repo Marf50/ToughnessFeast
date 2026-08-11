@@ -1,0 +1,20 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "local",
+      "displayName": "My machine",
+      "inherits": "default",
+      "cacheVariables": {
+        "KENSHILIB_DIR": "C:/path/to/KenshiLib_Examples_deps"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "local-release",
+      "configurePreset": "local",
+      "configuration": "Release"
+    }
+  ]
+}

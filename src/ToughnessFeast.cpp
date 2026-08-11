@@ -1,0 +1,459 @@
+// ToughnessFeast — RE_Kenshi / KenshiLib plugin
+// Soft-caps vanilla toughness combat bonuses at 100, allows toughness past 100,
+// and converts excess toughness into food-powered flesh / limb regeneration.
+//
+// Real game build: Windows MSVC + KenshiLib (see OPEN_IN_CLION.md).
+// Linux CLion: TOUGHNESSFEAST_LINUX_IDE uses bundled stubs so indexing works.
+
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+#include "kenshi_ide_stubs.h"
+#else
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+
+#include <Debug.h>
+#include <core/Functions.h>
+
+#include <kenshi/CharStats.h>
+#include <kenshi/Character.h>
+#include <kenshi/MedicalSystem.h>
+#include <kenshi/Enums.h>
+#endif
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
+
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+
+// Portable strncpy_s for non-MSVC real builds (MSVC already has it)
+#if !defined(_MSC_VER) && !defined(TOUGHNESSFEAST_LINUX_IDE)
+#ifndef _TRUNCATE
+#define _TRUNCATE ((size_t)-1)
+#endif
+static int tf_strncpy_s(char* dest, size_t destsz, const char* src, size_t)
+{
+    if (!dest || !destsz) return 1;
+    std::snprintf(dest, destsz, "%s", src ? src : "");
+    return 0;
+}
+#define strncpy_s tf_strncpy_s
+#endif
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+struct Config
+{
+    float combatCapToughness;
+    float foodRegenStart;
+    float foodRegenScalePerPoint;
+    float fleshHealPerSecond;
+    float stunHealPerSecond;
+    float hungerDrainPerSecond;
+    float minHungerToRegen;
+    bool healUnhealable;
+    float limbRegrowPerSecond;
+    float past100XpMult;
+    bool debugLog;
+};
+
+static Config g_cfg = {
+    100.f,  // combatCapToughness
+    75.f,   // foodRegenStart
+    0.04f,  // foodRegenScalePerPoint
+    2.5f,   // fleshHealPerSecond
+    1.5f,   // stunHealPerSecond
+    0.012f, // hungerDrainPerSecond
+    0.15f,  // minHungerToRegen
+    true,   // healUnhealable
+    0.15f,  // limbRegrowPerSecond
+    0.18f,  // past100XpMult
+    false   // debugLog
+};
+
+static std::string Trim(const std::string& s)
+{
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static bool ParseBool(const std::string& v)
+{
+    return v == "1" || v == "true" || v == "True" || v == "yes" || v == "YES";
+}
+
+// Plugin DLL directory (resolved in startPlugin)
+static char g_pluginDir[MAX_PATH] = { 0 };
+
+static void LoadConfig()
+{
+    char path[MAX_PATH + 32];
+    if (g_pluginDir[0])
+        std::snprintf(path, sizeof(path), "%s/config.ini", g_pluginDir);
+    else
+        std::snprintf(path, sizeof(path), "config.ini");
+
+    // Also try Windows-style path when built as DLL next to config
+    std::ifstream in(path);
+    if (!in && g_pluginDir[0])
+    {
+        std::snprintf(path, sizeof(path), "%s\\config.ini", g_pluginDir);
+        in.open(path);
+    }
+    if (!in)
+    {
+        DebugLog("ToughnessFeast: no config.ini found, using defaults");
+        return;
+    }
+
+    std::string line;
+    while (std::getline(in, line))
+    {
+        line = Trim(line);
+        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = Trim(line.substr(0, eq));
+        std::string val = Trim(line.substr(eq + 1));
+        if (key == "CombatCapToughness") g_cfg.combatCapToughness = (float)std::atof(val.c_str());
+        else if (key == "FoodRegenStartToughness") g_cfg.foodRegenStart = (float)std::atof(val.c_str());
+        else if (key == "FoodRegenScalePerPoint") g_cfg.foodRegenScalePerPoint = (float)std::atof(val.c_str());
+        else if (key == "FleshHealPerSecond") g_cfg.fleshHealPerSecond = (float)std::atof(val.c_str());
+        else if (key == "StunHealPerSecond") g_cfg.stunHealPerSecond = (float)std::atof(val.c_str());
+        else if (key == "HungerDrainPerSecond") g_cfg.hungerDrainPerSecond = (float)std::atof(val.c_str());
+        else if (key == "MinHungerToRegen") g_cfg.minHungerToRegen = (float)std::atof(val.c_str());
+        else if (key == "HealUnhealableWounds") g_cfg.healUnhealable = ParseBool(val);
+        else if (key == "LimbRegrowPerSecond") g_cfg.limbRegrowPerSecond = (float)std::atof(val.c_str());
+        else if (key == "Past100XpMult") g_cfg.past100XpMult = (float)std::atof(val.c_str());
+        else if (key == "DebugLog") g_cfg.debugLog = ParseBool(val);
+    }
+
+    char msg[256];
+    std::snprintf(msg, sizeof(msg),
+        "ToughnessFeast: config loaded (cap=%.0f start=%.0f scale=%.3f)",
+        g_cfg.combatCapToughness, g_cfg.foodRegenStart, g_cfg.foodRegenScalePerPoint);
+    DebugLog(msg);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static float RegenPower(float toughness)
+{
+    float excess = toughness - g_cfg.foodRegenStart;
+    if (excess <= 0.f) return 0.f;
+    return excess * g_cfg.foodRegenScalePerPoint;
+}
+
+// Temporarily clamp _toughness for vanilla combat formula functions
+struct ToughnessClamp
+{
+    CharStats* stats;
+    float saved;
+    bool active;
+
+    ToughnessClamp(CharStats* s, float cap)
+        : stats(s), saved(0.f), active(false)
+    {
+        if (!s) return;
+        saved = s->_toughness;
+        if (saved > cap)
+        {
+            s->_toughness = cap;
+            active = true;
+        }
+    }
+
+    ~ToughnessClamp()
+    {
+        if (active && stats)
+            stats->_toughness = saved;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Hooks: soft-cap DR + wound degen at CombatCapToughness
+// ---------------------------------------------------------------------------
+
+static float (*calculateToughnessDamageResistanceMult_orig)(CharStats*) = nullptr;
+static float calculateToughnessDamageResistanceMult_hook(CharStats* self)
+{
+    ToughnessClamp clamp(self, g_cfg.combatCapToughness);
+    return calculateToughnessDamageResistanceMult_orig(self);
+}
+
+static float (*calculateToughnessWoundDegenerationRate_orig)(CharStats*) = nullptr;
+static float calculateToughnessWoundDegenerationRate_hook(CharStats* self)
+{
+    ToughnessClamp clamp(self, g_cfg.combatCapToughness);
+    return calculateToughnessWoundDegenerationRate_orig(self);
+}
+
+// ---------------------------------------------------------------------------
+// Hooks: allow toughness XP past 100
+// ---------------------------------------------------------------------------
+
+static void (*xpStat_eventBased_orig)(CharStats*, StatsEnumerated, float) = nullptr;
+static void xpStat_eventBased_hook(CharStats* self, StatsEnumerated st, float amount)
+{
+    if (!self || st != STAT_TOUGHNESS)
+    {
+        xpStat_eventBased_orig(self, st, amount);
+        return;
+    }
+
+    float before = self->_toughness;
+    xpStat_eventBased_orig(self, st, amount);
+    float after = self->_toughness;
+    float gained = after - before;
+
+    // Soft-cap stalled near/above 100 — residual growth at reduced rate
+    if (before >= 99.5f && gained < amount * 0.02f)
+    {
+        float over = (before > 100.f) ? (before - 100.f) : 0.f;
+        float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
+        float forced = amount * mult;
+        if (forced > 0.f)
+            self->_toughness = before + forced;
+    }
+}
+
+static void (*xpStat_timeBased_orig)(CharStats*, StatsEnumerated) = nullptr;
+static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
+{
+    if (!self || st != STAT_TOUGHNESS)
+    {
+        xpStat_timeBased_orig(self, st);
+        return;
+    }
+
+    float before = self->_toughness;
+    xpStat_timeBased_orig(self, st);
+    float after = self->_toughness;
+
+    if (before >= 99.5f && after <= before + 0.0001f)
+    {
+        float over = (before > 100.f) ? (before - 100.f) : 0.f;
+        float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
+        self->_toughness = before + 0.002f * mult;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Food-powered regeneration (post medicalUpdate)
+// ---------------------------------------------------------------------------
+
+static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
+{
+    if (!med || frameTime <= 0.f) return;
+    if (med->dead) return;
+
+    CharStats* stats = med->stats;
+    Character* me = med->me;
+    if (!stats || !me) return;
+
+    // Skeletons / non-eaters: no metabolic flesh regen
+    if (!me->amSomeoneWhoNeedsToEatToLive())
+        return;
+
+    float tough = stats->_toughness;
+    float power = RegenPower(tough);
+    if (power <= 0.f) return;
+    if (power > 4.f) power = 4.f;
+
+    if (med->hunger < g_cfg.minHungerToRegen)
+        return;
+
+    float fleshBudget = g_cfg.fleshHealPerSecond * power * frameTime;
+    float stunBudget = g_cfg.stunHealPerSecond * power * frameTime;
+    float limbBudget = g_cfg.limbRegrowPerSecond * power * frameTime;
+    float hungerCost = 0.f;
+    bool anyHeal = false;
+
+    int count = med->getPartCount();
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            MedicalSystem::HealthPartStatus* part = med->getPart((unsigned long long)i);
+            if (!part) continue;
+            if (part->isRobotic()) continue;
+            if (part->isDead()) continue;
+
+            float maxHp = part->maxHealth();
+            if (maxHp <= 0.f) continue;
+
+            bool isOverdamage = part->flesh < 0.f;
+            if (pass == 0 && !isOverdamage) continue;
+            if (pass == 1 && isOverdamage) continue;
+            if (isOverdamage && !g_cfg.healUnhealable) continue;
+
+            if (part->fleshStun > 0.f && stunBudget > 0.f)
+            {
+                float take = (part->fleshStun < stunBudget) ? part->fleshStun : stunBudget;
+                part->fleshStun -= take;
+                stunBudget -= take;
+                hungerCost += take * 0.15f;
+                anyHeal = true;
+            }
+
+            if (part->flesh < maxHp && fleshBudget > 0.f)
+            {
+                float need = maxHp - part->flesh;
+                float rate = isOverdamage ? 0.45f : 1.f;
+                float room = fleshBudget * rate;
+                float take = (need < room) ? need : room;
+                part->flesh += take;
+                fleshBudget -= take / rate;
+                hungerCost += take * (isOverdamage ? 0.55f : 0.25f);
+                anyHeal = true;
+            }
+
+            // Slow organic recovery on ruined limbs (not full magic regrowth)
+            if (limbBudget > 0.f
+                && part->whatAmI != MedicalSystem::HealthPartStatus::PART_TORSO
+                && part->whatAmI != MedicalSystem::HealthPartStatus::PART_HEAD)
+            {
+                LimbState ls = part->getRobotLimbState();
+                bool ruined = (ls == LIMB_CRUSHED || ls == LIMB_STUMP || part->flesh < maxHp * 0.05f);
+                if (ruined && part->flesh < maxHp * 0.25f)
+                {
+                    float take = (limbBudget < maxHp * 0.02f) ? limbBudget : (maxHp * 0.02f);
+                    part->flesh += take;
+                    limbBudget -= take;
+                    hungerCost += take * 1.2f;
+                    anyHeal = true;
+                }
+            }
+
+            part->updateDerivedHealths();
+        }
+    }
+
+    if (anyHeal && hungerCost > 0.f)
+    {
+        float drain = g_cfg.hungerDrainPerSecond * power * frameTime;
+        drain += hungerCost * 0.0015f;
+        float next = med->hunger - drain;
+        med->hunger = (next > 0.f) ? next : 0.f;
+
+        if (g_cfg.debugLog)
+        {
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                "ToughnessFeast: regen t=%.1f p=%.2f hunger=%.3f",
+                tough, power, med->hunger);
+            DebugLog(msg);
+        }
+    }
+}
+
+static void (*medicalUpdate_orig)(MedicalSystem*, float) = nullptr;
+static void medicalUpdate_hook(MedicalSystem* self, float frameTime)
+{
+    medicalUpdate_orig(self, frameTime);
+    ApplyFoodRegen(self, frameTime);
+}
+
+// ---------------------------------------------------------------------------
+// Plugin entry
+// ---------------------------------------------------------------------------
+
+static void ResolvePluginDir()
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    (void)g_pluginDir;
+#else
+    HMODULE hm = nullptr;
+    if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&ResolvePluginDir,
+            &hm))
+    {
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(hm, path, MAX_PATH);
+        if (n > 0 && n < MAX_PATH)
+        {
+            for (int i = (int)n - 1; i >= 0; --i)
+            {
+                if (path[i] == '\\' || path[i] == '/')
+                {
+                    path[i] = 0;
+                    break;
+                }
+            }
+            strncpy_s(g_pluginDir, path, _TRUNCATE);
+        }
+    }
+#endif
+}
+
+#if defined(_MSC_VER)
+#define TF_EXPORT __declspec(dllexport)
+#else
+#define TF_EXPORT __attribute__((visibility("default")))
+#endif
+
+extern "C" TF_EXPORT void startPlugin()
+{
+    ResolvePluginDir();
+    LoadConfig();
+
+    DebugLog("ToughnessFeast: installing hooks...");
+
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&CharStats::calculateToughnessDamageResistanceMult),
+            (void*)calculateToughnessDamageResistanceMult_hook,
+            (void**)&calculateToughnessDamageResistanceMult_orig))
+    {
+        ErrorLog("ToughnessFeast: failed to hook calculateToughnessDamageResistanceMult");
+    }
+
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&CharStats::calculateToughnessWoundDegenerationRate),
+            (void*)calculateToughnessWoundDegenerationRate_hook,
+            (void**)&calculateToughnessWoundDegenerationRate_orig))
+    {
+        ErrorLog("ToughnessFeast: failed to hook calculateToughnessWoundDegenerationRate");
+    }
+
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&CharStats::xpStat_eventBased),
+            (void*)xpStat_eventBased_hook,
+            (void**)&xpStat_eventBased_orig))
+    {
+        ErrorLog("ToughnessFeast: failed to hook xpStat_eventBased");
+    }
+
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&CharStats::xpStat_timeBased),
+            (void*)xpStat_timeBased_hook,
+            (void**)&xpStat_timeBased_orig))
+    {
+        ErrorLog("ToughnessFeast: failed to hook xpStat_timeBased");
+    }
+
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&MedicalSystem::medicalUpdate),
+            (void*)medicalUpdate_hook,
+            (void**)&medicalUpdate_orig))
+    {
+        ErrorLog("ToughnessFeast: failed to hook MedicalSystem::medicalUpdate");
+    }
+
+    DebugLog("ToughnessFeast: ready — toughness past 100 trades combat soft-cap for food regen");
+}

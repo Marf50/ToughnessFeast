@@ -1,0 +1,12 @@
+cmake-build-*/
+build/
+.idea/
+.vs/
+CMakeUserPresets.json
+**/ToughnessFeast.dll
+**/ToughnessFeast.pdb
+**/ToughnessFeast.exp
+**/ToughnessFeast.lib
+*.user
+*.suo
+third_party/KenshiLib/
