@@ -23,6 +23,8 @@
 #include <kenshi/Enums.h>
 #include <kenshi/RaceData.h>
 #include <kenshi/GameData.h>
+#include <kenshi/util/StringPair.h>
+#include <kenshi/util/lektor.h>
 #include <kenshi/gui/DatapanelGUI.h>
 #include <kenshi/gui/DataPanelLine.h>
 #endif
@@ -522,7 +524,11 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
 }
 
 // ---------------------------------------------------------------------------
-// GUI / tooltips — show what ToughnessFeast is doing on character panels
+// GUI / tooltips — hook REAL Kenshi hover surfaces:
+//   - Toughness hover: CharStats::getStatPenaltiesForGUI
+//   - Hunger hover:    CharStats::printExertionHungerMultTooltip
+//   - Status details:  Character::updateGUIStatsDetails
+//   - Medical HUD:     MedicalSystem::getMedicalGUIData (+ limb line tooltips)
 // ---------------------------------------------------------------------------
 
 static const char* RaceKindName(RaceKind k)
@@ -536,55 +542,42 @@ static const char* RaceKindName(RaceKind k)
     }
 }
 
-static void DescribeLimbProgress(MedicalSystem* med, char* out, size_t outsz)
+// Grow a lektor<StringPair>.
+// lektor privately inherits its allocator, so we only use free capacity
+// via placement-new, otherwise fold into the last line's right-hand text.
+static void LektorPushPair(lektor<StringPair>& dats, const std::string& a, const std::string& b)
 {
-    if (!out || outsz == 0) return;
-    out[0] = 0;
-    if (!med) { std::snprintf(out, outsz, "none"); return; }
-
-    MedicalSystem::HealthPartStatus* limbs[4] = {
-        med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
-    };
-    const char* names[4] = { "L-Arm", "R-Arm", "L-Leg", "R-Leg" };
-
-    char buf[256];
-    buf[0] = 0;
-    int missing = 0;
-    for (int i = 0; i < 4; ++i)
+    if (dats.stuff && dats.count < dats.maxSize)
     {
-        MedicalSystem::HealthPartStatus* p = limbs[i];
-        if (!p) continue;
-        LimbState ls = p->getRobotLimbState();
-        if (ls != LIMB_STUMP && ls != LIMB_CRUSHED) continue;
-        ++missing;
-        float maxHp = p->maxHealth();
-        if (maxHp <= 1.f) maxHp = p->_maxHealth;
-        if (maxHp <= 1.f) maxHp = 100.f;
-        float pct = (p->flesh / maxHp) * 100.f;
-        if (pct < 0.f) pct = 0.f;
-        if (pct > 100.f) pct = 100.f;
-        char piece[64];
-        std::snprintf(piece, sizeof(piece), "%s%s %s %.0f%%",
-            buf[0] ? ", " : "",
-            names[i],
-            ls == LIMB_STUMP ? "stump" : "crush",
-            pct);
-        // append carefully
-        size_t bl = std::strlen(buf);
-        size_t pl = std::strlen(piece);
-        if (bl + pl + 1 < sizeof(buf))
-            std::memcpy(buf + bl, piece, pl + 1);
+        new (static_cast<void*>(dats.stuff + dats.count)) StringPair(a, b);
+        dats.count++;
+        return;
     }
-    if (missing == 0)
-        std::snprintf(out, outsz, "no missing limbs");
-    else
-        std::snprintf(out, outsz, "%s", buf);
+
+    // No free slot — append as extra lines on the last pair (still visible in tooltip)
+    if (dats.stuff && dats.count > 0)
+    {
+        std::string& right = dats.stuff[dats.count - 1].s2;
+        if (!right.empty())
+            right += "\n";
+        right += a;
+        right += ": ";
+        right += b;
+        return;
+    }
+
+    // Empty tooltip with no capacity — nothing we can safely do
 }
 
-// Build multi-line tooltip text for toughness / medical
-static std::string BuildTfTooltipText(Character* me, CharStats* stats, MedicalSystem* med)
+static void LektorPushPairPtr(lektor<StringPair>* dats, const std::string& a, const std::string& b)
 {
-    if (!stats) return "ToughnessFeast: no stats";
+    if (dats)
+        LektorPushPair(*dats, a, b);
+}
+
+static void AppendTfTooltipPairs(lektor<StringPair>& dats, Character* me, CharStats* stats, MedicalSystem* med)
+{
+    if (!stats) return;
 
     RaceKind rk = ClassifyRace(me);
     float tough = stats->_toughness;
@@ -600,148 +593,309 @@ static std::string BuildTfTooltipText(Character* me, CharStats* stats, MedicalSy
         fedOk = (hunger >= g_cfg.minHungerToRegen) || med->isFed();
     }
 
-    char limb[256];
-    DescribeLimbProgress(med, limb, sizeof(limb));
+    char unlock[96];
+    std::snprintf(unlock, sizeof(unlock), "%s unlock at %.0f toughness", RaceKindName(rk), start);
 
-    const char* combatNote = (tough > g_cfg.combatCapToughness)
-        ? "Combat DR/wound soft-capped at 100"
-        : "Combat bonuses still scale with toughness";
-
-    char body[768];
-    std::snprintf(body, sizeof(body),
-        "ToughnessFeast\n"
-        "Race: %s\n"
-        "Toughness: %.1f (food regen unlock at %.0f)\n"
-        "Food regen power: %.0f%% %s\n"
-        "Hunger: %.0f%%  %s\n"
-        "%s\n"
-        "Limbs: %s\n"
-        "Heal rates @ power 1.0: flesh %.1f/s, limbs %.1f/s",
-        RaceKindName(rk),
-        tough, start,
-        power * 100.f,
-        power <= 0.f ? "(need more toughness)" : (fedOk ? "(active if wounded)" : "(paused — eat)"),
-        hunger * 100.f,
-        fedOk ? "fed enough" : "too hungry to regen",
-        combatNote,
-        limb,
-        g_cfg.fleshHealPerSecond,
-        g_cfg.limbRegrowPerSecond);
-    return std::string(body);
-}
-
-static void TfSetLine(DatapanelGUI* panel, int category,
-    const char* key, const char* label, const char* value, const char* tip)
-{
-    if (!panel) return;
-    DataPanelLine* line = panel->setLine(
-        std::string(key),
-        std::string(label),
-        std::string(value),
-        category,
-        false,
-        true);
-    if (line && tip && tip[0])
-        line->setToolTip(std::string(tip));
-}
-
-static void AppendTfGui(DatapanelGUI* panel, int category,
-    Character* me, CharStats* stats, MedicalSystem* med)
-{
-    if (!g_cfg.showGuiTooltips) return;
-    if (!panel || !stats) return;
-
-    RaceKind rk = ClassifyRace(me);
-    float tough = stats->_toughness;
-    float start = FoodRegenStartFor(me);
-    float power = RegenPower(me, tough);
-    if (power > 4.f) power = 4.f;
-    bool fedOk = true;
-    float hunger = 0.f;
-    if (med)
-    {
-        hunger = med->hunger;
-        fedOk = (hunger >= g_cfg.minHungerToRegen) || med->isFed();
-    }
-
-    char limb[256];
-    DescribeLimbProgress(med, limb, sizeof(limb));
-    std::string tip = BuildTfTooltipText(me, stats, med);
-
-    char vRace[64];
-    std::snprintf(vRace, sizeof(vRace), "%s  unlock@%.0f", RaceKindName(rk), start);
-
-    char vPower[80];
+    char powerS[96];
     if (power <= 0.f)
-        std::snprintf(vPower, sizeof(vPower), "locked (need %.0f toughness)", start);
+        std::snprintf(powerS, sizeof(powerS), "locked (need %.0f)", start);
     else if (!fedOk)
-        std::snprintf(vPower, sizeof(vPower), "%.0f%% paused (eat)", power * 100.f);
+        std::snprintf(powerS, sizeof(powerS), "%.0f%% — paused, eat food", power * 100.f);
     else
-        std::snprintf(vPower, sizeof(vPower), "%.0f%% active", power * 100.f);
+        std::snprintf(powerS, sizeof(powerS), "%.0f%% — healing wounds/limbs", power * 100.f);
 
-    char vCombat[64];
+    char combat[96];
     if (tough > g_cfg.combatCapToughness)
-        std::snprintf(vCombat, sizeof(vCombat), "soft-cap %.0f (excess -> regen)", g_cfg.combatCapToughness);
+        std::snprintf(combat, sizeof(combat), "soft-capped at %.0f (no extra DR)", g_cfg.combatCapToughness);
     else
-        std::snprintf(vCombat, sizeof(vCombat), "normal (cap %.0f)", g_cfg.combatCapToughness);
+        std::snprintf(combat, sizeof(combat), "scales normally until %.0f", g_cfg.combatCapToughness);
 
-    char vLimb[280];
-    std::snprintf(vLimb, sizeof(vLimb), "%s", limb);
+    // Blank separator then TF lines (s1 = left label, s2 = right value)
+    LektorPushPair(dats, "----", "ToughnessFeast");
+    LektorPushPair(dats, "TF race", unlock);
+    LektorPushPair(dats, "TF food regen", powerS);
+    LektorPushPair(dats, "TF combat", combat);
 
-    // Visual separator + status rows (hover for full tooltip)
-    TfSetLine(panel, category, "TF_Head", "ToughnessFeast", "food / limb regen", tip.c_str());
-    TfSetLine(panel, category, "TF_Race", "TF race unlock", vRace, tip.c_str());
-    TfSetLine(panel, category, "TF_Power", "TF food regen", vPower, tip.c_str());
-    TfSetLine(panel, category, "TF_Combat", "TF combat", vCombat, tip.c_str());
-    TfSetLine(panel, category, "TF_Limbs", "TF limbs", vLimb, tip.c_str());
-}
-
-static void (*getMedicalGUIData_orig)(MedicalSystem*, DatapanelGUI*) = nullptr;
-static void getMedicalGUIData_hook(MedicalSystem* self, DatapanelGUI* panel)
-{
-    getMedicalGUIData_orig(self, panel);
-    if (!self || !panel) return;
-    // Medical panel typically uses category 0
-    AppendTfGui(panel, 0, self->me, self->stats, self);
-}
-
-static void (*charStatsGetGUIData_orig)(CharStats*, DatapanelGUI*, int) = nullptr;
-static void charStatsGetGUIData_hook(CharStats* self, DatapanelGUI* panel, int category)
-{
-    charStatsGetGUIData_orig(self, panel, category);
-    if (!self || !panel) return;
-    AppendTfGui(panel, category, self->me, self, self->medical);
-
-    // Also try to attach tooltip to the vanilla Toughness row if present
-    if (g_cfg.showGuiTooltips)
+    if (med)
     {
-        std::string tip = BuildTfTooltipText(self->me, self, self->medical);
-        const char* keys[] = {
-            "Toughness", "toughness", "STAT_TOUGHNESS", "stat_toughness", nullptr
+        MedicalSystem::HealthPartStatus* limbs[4] = {
+            med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
         };
-        for (int i = 0; keys[i]; ++i)
+        const char* names[4] = { "Left arm", "Right arm", "Left leg", "Right leg" };
+        for (int i = 0; i < 4; ++i)
         {
-            DataPanelLine* line = panel->getLine(std::string(keys[i]), category);
-            if (line)
-                line->setToolTip(tip);
+            MedicalSystem::HealthPartStatus* p = limbs[i];
+            if (!p) continue;
+            LimbState ls = p->getRobotLimbState();
+            if (ls != LIMB_STUMP && ls != LIMB_CRUSHED) continue;
+            float maxHp = p->maxHealth();
+            if (maxHp <= 1.f) maxHp = p->_maxHealth;
+            if (maxHp <= 1.f) maxHp = 100.f;
+            float pct = (p->flesh / maxHp) * 100.f;
+            if (pct < 0.f) pct = 0.f;
+            char limbS[96];
+            std::snprintf(limbS, sizeof(limbS), "%s regrow %.0f%% (need %.0f%%)",
+                ls == LIMB_STUMP ? "stump" : "crushed",
+                pct, g_cfg.limbRestoreFleshPct * 100.f);
+            LektorPushPair(dats, names[i], limbS);
         }
     }
 }
 
-static void (*getGUIDataForMainInfo_orig)(CharStats*, DatapanelGUI*, int, bool) = nullptr;
-static void getGUIDataForMainInfo_hook(CharStats* self, DatapanelGUI* panel, int category, bool combatMode)
+// --- Toughness (and any stat) hover tooltip ---
+static bool (*getStatPenaltiesForGUI_orig)(CharStats*, const std::string&, StatsEnumerated, lektor<StringPair>&) = nullptr;
+static bool getStatPenaltiesForGUI_hook(CharStats* self, const std::string& statName,
+    StatsEnumerated stat, lektor<StringPair>& dats)
 {
-    getGUIDataForMainInfo_orig(self, panel, category, combatMode);
-    if (!self || !panel) return;
-    // Compact one-liner on main info
-    if (!g_cfg.showGuiTooltips) return;
+    bool r = getStatPenaltiesForGUI_orig(self, statName, stat, dats);
+    if (!g_cfg.showGuiTooltips || !self) return r;
+
+    // Toughness hover, or any call where the name mentions toughness
+    bool isTough = (stat == STAT_TOUGHNESS);
+    if (!isTough && !statName.empty())
+    {
+        std::string low = statName;
+        for (size_t i = 0; i < low.size(); ++i)
+            if (low[i] >= 'A' && low[i] <= 'Z') low[i] = (char)(low[i] - 'A' + 'a');
+        if (low.find("tough") != std::string::npos)
+            isTough = true;
+    }
+    if (isTough)
+        AppendTfTooltipPairs(dats, self->me, self, self->medical);
+    return r;
+}
+
+// --- Hunger / food / exertion hover ---
+static void (*printExertionHungerMultTooltip_orig)(CharStats*, lektor<StringPair>*) = nullptr;
+static void printExertionHungerMultTooltip_hook(CharStats* self, lektor<StringPair>* dats)
+{
+    printExertionHungerMultTooltip_orig(self, dats);
+    if (!g_cfg.showGuiTooltips || !self || !dats) return;
+
     float power = RegenPower(self->me, self->_toughness);
     if (power > 4.f) power = 4.f;
-    char v[96];
-    std::snprintf(v, sizeof(v), "regen %.0f%% | cap %.0f",
+    float start = FoodRegenStartFor(self->me);
+
+    char line[128];
+    if (power <= 0.f)
+        std::snprintf(line, sizeof(line), "locked until toughness %.0f", start);
+    else
+        std::snprintf(line, sizeof(line), "drives TF regen (power %.0f%%)", power * 100.f);
+
+    LektorPushPairPtr(dats, "----", "ToughnessFeast");
+    LektorPushPairPtr(dats, "TF food regen", line);
+    LektorPushPairPtr(dats, "TF note", "Stay fed to heal flesh & regrow limbs");
+}
+
+// --- Status panel "details" when hovering a stat name ---
+static void (*updateGUIStatsDetails_orig)(Character*, DatapanelGUI*, const std::string&, int) = nullptr;
+static void updateGUIStatsDetails_hook(Character* self, DatapanelGUI* panel,
+    const std::string& name, int statId)
+{
+    updateGUIStatsDetails_orig(self, panel, name, statId);
+    if (!g_cfg.showGuiTooltips || !self || !panel) return;
+
+    bool want = (statId == (int)STAT_TOUGHNESS);
+    std::string low = name;
+    for (size_t i = 0; i < low.size(); ++i)
+        if (low[i] >= 'A' && low[i] <= 'Z') low[i] = (char)(low[i] - 'A' + 'a');
+    if (low.find("tough") != std::string::npos)
+        want = true;
+
+    if (!want) return;
+
+    CharStats* stats = self->getStats();
+    MedicalSystem* med = self->getMedical();
+    if (!stats) return;
+
+    RaceKind rk = ClassifyRace(self);
+    float tough = stats->_toughness;
+    float start = FoodRegenStartFor(self);
+    float power = RegenPower(self, tough);
+    if (power > 4.f) power = 4.f;
+
+    char v1[96], v2[96], v3[96], v4[160];
+    std::snprintf(v1, sizeof(v1), "%s  (unlock @ %.0f)", RaceKindName(rk), start);
+    if (power <= 0.f)
+        std::snprintf(v2, sizeof(v2), "Locked — need %.0f toughness", start);
+    else
+        std::snprintf(v2, sizeof(v2), "%.0f%% while fed", power * 100.f);
+    if (tough > g_cfg.combatCapToughness)
+        std::snprintf(v3, sizeof(v3), "Soft-capped at %.0f", g_cfg.combatCapToughness);
+    else
+        std::snprintf(v3, sizeof(v3), "Normal until %.0f", g_cfg.combatCapToughness);
+
+    // Limb summary
+    v4[0] = 0;
+    if (med)
+    {
+        MedicalSystem::HealthPartStatus* limbs[4] = {
+            med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
+        };
+        const char* shortN[4] = { "LA", "RA", "LL", "RL" };
+        for (int i = 0; i < 4; ++i)
+        {
+            if (!limbs[i]) continue;
+            LimbState ls = limbs[i]->getRobotLimbState();
+            if (ls != LIMB_STUMP && ls != LIMB_CRUSHED) continue;
+            float maxHp = limbs[i]->maxHealth();
+            if (maxHp <= 1.f) maxHp = 100.f;
+            float pct = (limbs[i]->flesh / maxHp) * 100.f;
+            char piece[40];
+            std::snprintf(piece, sizeof(piece), "%s%s%.0f%%",
+                v4[0] ? " " : "", shortN[i], pct < 0.f ? 0.f : pct);
+            size_t n = std::strlen(v4);
+            if (n + std::strlen(piece) + 1 < sizeof(v4))
+                std::memcpy(v4 + n, piece, std::strlen(piece) + 1);
+        }
+    }
+    if (!v4[0])
+        std::snprintf(v4, sizeof(v4), "no missing limbs");
+
+    // Description panel usually category 0
+    const int cat = 0;
+    std::string tip = "ToughnessFeast food-powered regen & limb regrowth";
+    DataPanelLine* a = panel->setLine(std::string("TF_d1"), std::string("TF race"), std::string(v1), cat, false, true);
+    DataPanelLine* b = panel->setLine(std::string("TF_d2"), std::string("TF food regen"), std::string(v2), cat, false, true);
+    DataPanelLine* c = panel->setLine(std::string("TF_d3"), std::string("TF combat"), std::string(v3), cat, false, true);
+    DataPanelLine* d = panel->setLine(std::string("TF_d4"), std::string("TF limbs"), std::string(v4), cat, false, true);
+    if (a) a->setToolTip(tip);
+    if (b) b->setToolTip(tip);
+    if (c) c->setToolTip(tip);
+    if (d) d->setToolTip(tip);
+}
+
+// --- Medical / status HUD body panel ---
+static void (*getMedicalGUIData_orig)(MedicalSystem*, DatapanelGUI*) = nullptr;
+static void getMedicalGUIData_hook(MedicalSystem* self, DatapanelGUI* panel)
+{
+    getMedicalGUIData_orig(self, panel);
+    if (!g_cfg.showGuiTooltips || !self || !panel) return;
+
+    CharStats* stats = self->stats;
+    Character* me = self->me;
+    float power = stats ? RegenPower(me, stats->_toughness) : 0.f;
+    if (power > 4.f) power = 4.f;
+    float start = FoodRegenStartFor(me);
+
+    char head[96];
+    if (power <= 0.f)
+        std::snprintf(head, sizeof(head), "locked (need T%.0f)", start);
+    else
+        std::snprintf(head, sizeof(head), "regen %.0f%% if fed", power * 100.f);
+
+    // Try several categories — medical panel category varies by build
+    for (int cat = 0; cat <= 4; ++cat)
+    {
+        DataPanelLine* line = panel->setLine(
+            std::string("TF_MedHead"),
+            std::string("ToughnessFeast"),
+            std::string(head),
+            cat, false, true);
+        if (!line) continue;
+
+        std::string tip = "Food-powered flesh heal + stump regrowth.\n";
+        tip += "Hover toughness/hunger for full details.";
+        line->setToolTip(tip);
+        line->setToolTipMainBar(tip, true);
+
+        // Attach richer tooltips to existing limb rows by scanning lines
+        int n = panel->getNumLines(cat);
+        for (int i = 0; i < n; ++i)
+        {
+            DataPanelLine* ln = panel->getLineByNum(cat, i);
+            if (!ln) continue;
+            // Match common limb labels in s1 / keyValue
+            const std::string& s = ln->s1;
+            const std::string& k = ln->keyValue;
+            std::string blob = s + " " + k;
+            for (size_t j = 0; j < blob.size(); ++j)
+                if (blob[j] >= 'A' && blob[j] <= 'Z') blob[j] = (char)(blob[j] - 'A' + 'a');
+
+            bool limbish =
+                blob.find("arm") != std::string::npos
+                || blob.find("leg") != std::string::npos
+                || blob.find("hand") != std::string::npos
+                || blob.find("foot") != std::string::npos
+                || blob.find("limb") != std::string::npos
+                || blob.find("stump") != std::string::npos;
+
+            if (!limbish) continue;
+
+            // Pick matching med part for % if possible
+            MedicalSystem::HealthPartStatus* part = nullptr;
+            if (blob.find("left") != std::string::npos && blob.find("arm") != std::string::npos)
+                part = self->leftArm;
+            else if (blob.find("right") != std::string::npos && blob.find("arm") != std::string::npos)
+                part = self->rightArm;
+            else if (blob.find("left") != std::string::npos && blob.find("leg") != std::string::npos)
+                part = self->leftLeg;
+            else if (blob.find("right") != std::string::npos && blob.find("leg") != std::string::npos)
+                part = self->rightLeg;
+
+            char ltip[256];
+            if (part)
+            {
+                LimbState ls = part->getRobotLimbState();
+                float maxHp = part->maxHealth();
+                if (maxHp <= 1.f) maxHp = 100.f;
+                float pct = (part->flesh / maxHp) * 100.f;
+                const char* st =
+                    ls == LIMB_STUMP ? "STUMP — regenerating"
+                    : ls == LIMB_CRUSHED ? "CRUSHED — regenerating"
+                    : ls == LIMB_REPLACED ? "prosthetic (not TF)"
+                    : "organic";
+                std::snprintf(ltip, sizeof(ltip),
+                    "ToughnessFeast\n%s\nFlesh: %.0f%%\nRestore at %.0f%% if stump/crush\nFood regen power: %.0f%%",
+                    st, pct < 0.f ? 0.f : pct,
+                    g_cfg.limbRestoreFleshPct * 100.f,
+                    power * 100.f);
+            }
+            else
+            {
+                std::snprintf(ltip, sizeof(ltip),
+                    "ToughnessFeast\nFood regen power: %.0f%%\nStay fed to heal / regrow",
+                    power * 100.f);
+            }
+            ln->setToolTip(std::string(ltip));
+            ln->setToolTipMainBar(std::string(ltip), true);
+        }
+    }
+}
+
+// Keep stats-window getGUIData hook but only inject into attributes-like calls
+// when the panel is being built (category passed through).
+static void (*charStatsGetGUIData_orig)(CharStats*, DatapanelGUI*, int) = nullptr;
+static void charStatsGetGUIData_hook(CharStats* self, DatapanelGUI* panel, int category)
+{
+    charStatsGetGUIData_orig(self, panel, category);
+    if (!g_cfg.showGuiTooltips || !self || !panel) return;
+
+    // Find toughness row and attach main-bar style tooltip
+    float power = RegenPower(self->me, self->_toughness);
+    if (power > 4.f) power = 4.f;
+    float start = FoodRegenStartFor(self->me);
+    char tip[320];
+    std::snprintf(tip, sizeof(tip),
+        "ToughnessFeast\n"
+        "Food regen unlock: %.0f (%s)\n"
+        "Current power: %.0f%%\n"
+        "Combat soft-cap: %.0f\n"
+        "Hover for penalties list with TF lines",
+        start, RaceKindName(ClassifyRace(self->me)),
         power * 100.f, g_cfg.combatCapToughness);
-    std::string tip = BuildTfTooltipText(self->me, self, self->medical);
-    TfSetLine(panel, category, "TF_Main", "ToughnessFeast", v, tip.c_str());
+
+    const char* keys[] = {
+        "Toughness", "toughness", "attributes_toughness", "stat_toughness",
+        "ToughnessSkill", nullptr
+    };
+    for (int i = 0; keys[i]; ++i)
+    {
+        DataPanelLine* line = panel->getLine(std::string(keys[i]), category);
+        if (!line) continue;
+        line->setToolTip(std::string(tip));
+        line->setToolTipMainBar(std::string(tip), true);
+    }
 }
 
 static void (*medicalUpdate_orig)(MedicalSystem*, float) = nullptr;
@@ -837,12 +991,37 @@ extern "C" TF_EXPORT void startPlugin()
         ErrorLog("ToughnessFeast: failed to hook MedicalSystem::medicalUpdate");
     }
 
+    // --- Real hover tooltips ---
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&CharStats::getStatPenaltiesForGUI),
+            (void*)getStatPenaltiesForGUI_hook,
+            (void**)&getStatPenaltiesForGUI_orig))
+    {
+        ErrorLog("ToughnessFeast: failed to hook getStatPenaltiesForGUI (toughness hover)");
+    }
+
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&CharStats::printExertionHungerMultTooltip),
+            (void*)printExertionHungerMultTooltip_hook,
+            (void**)&printExertionHungerMultTooltip_orig))
+    {
+        ErrorLog("ToughnessFeast: failed to hook printExertionHungerMultTooltip (food hover)");
+    }
+
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&Character::updateGUIStatsDetails),
+            (void*)updateGUIStatsDetails_hook,
+            (void**)&updateGUIStatsDetails_orig))
+    {
+        ErrorLog("ToughnessFeast: failed to hook updateGUIStatsDetails (status details)");
+    }
+
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(
             KenshiLib::GetRealAddress(&MedicalSystem::getMedicalGUIData),
             (void*)getMedicalGUIData_hook,
             (void**)&getMedicalGUIData_orig))
     {
-        ErrorLog("ToughnessFeast: failed to hook getMedicalGUIData");
+        ErrorLog("ToughnessFeast: failed to hook getMedicalGUIData (medical HUD)");
     }
 
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(
@@ -853,13 +1032,6 @@ extern "C" TF_EXPORT void startPlugin()
         ErrorLog("ToughnessFeast: failed to hook CharStats::getGUIData");
     }
 
-    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
-            KenshiLib::GetRealAddress(&CharStats::getGUIDataForMainInfo),
-            (void*)getGUIDataForMainInfo_hook,
-            (void**)&getGUIDataForMainInfo_orig))
-    {
-        ErrorLog("ToughnessFeast: failed to hook getGUIDataForMainInfo");
-    }
-
-    DebugLog("ToughnessFeast: ready — race regen + GUI tooltips; combat soft-cap 100");
+    DebugLog("ToughnessFeast: ready — hover toughness/hunger/limbs for TF tooltips");
 }
+

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <string>
 
 #ifndef MAX_PATH
@@ -69,18 +70,44 @@ public:
     GameData* data = nullptr;
 };
 
-class Character
+class StringPair
 {
 public:
-    bool amSomeoneWhoNeedsToEatToLive() { return true; }
-    bool isPlayerCharacter() const { return true; }
-    RaceData* getRace() const { return nullptr; }
+    StringPair() {}
+    StringPair(const std::string& a, const std::string& b) : s1(a), s2(b) {}
+    StringPair(const StringPair& o) : s1(o.s1), s2(o.s2), val1(o.val1) {}
+    virtual ~StringPair() {}
+    std::string s1;
+    std::string s2;
+    float val1 = 0.f;
+};
+
+template <typename T>
+class lektor
+{
+public:
+    uint32_t count = 0;
+    uint32_t maxSize = 0;
+    T* stuff = nullptr;
+
+    T* allocate(uint32_t n) { return static_cast<T*>(::operator new(sizeof(T) * n)); }
+    void deallocate(T* p, uint32_t) { ::operator delete(p); }
+    void construct(T* p) { new (p) T(); }
+    void construct(T* p, const T& v) { new (p) T(v); }
+    void destroy(T* p) { p->~T(); }
+    uint32_t size() const { return count; }
+    T& operator[](uint32_t i) { return stuff[i]; }
 };
 
 class DataPanelLine
 {
 public:
+    std::string keyValue;
+    std::string s1;
+    std::string s2;
     void setToolTip(const std::string&) {}
+    void setToolTipMainBar(const std::string&, bool) {}
+    void setToolTipMainBar(const lektor<StringPair>&, bool) {}
 };
 
 class DatapanelGUI
@@ -91,6 +118,19 @@ public:
         return nullptr;
     }
     DataPanelLine* getLine(const std::string&, int) { return nullptr; }
+    int getNumLines(int) { return 0; }
+    DataPanelLine* getLineByNum(int, int) { return nullptr; }
+};
+
+class Character
+{
+public:
+    bool amSomeoneWhoNeedsToEatToLive() { return true; }
+    bool isPlayerCharacter() const { return true; }
+    RaceData* getRace() const { return nullptr; }
+    CharStats* getStats() { return nullptr; }
+    MedicalSystem* getMedical() { return nullptr; }
+    void updateGUIStatsDetails(DatapanelGUI*, const std::string&, int) {}
 };
 
 class RobotLimbs
@@ -112,6 +152,8 @@ public:
     void xpStat_timeBased(StatsEnumerated) {}
     void getGUIData(DatapanelGUI*, int) {}
     void getGUIDataForMainInfo(DatapanelGUI*, int, bool) {}
+    bool getStatPenaltiesForGUI(const std::string&, StatsEnumerated, lektor<StringPair>&) { return false; }
+    void printExertionHungerMultTooltip(lektor<StringPair>*) {}
 };
 
 class MedicalSystem
