@@ -217,6 +217,127 @@ static void LoadConfig()
 // Read MSVC-layout string bytes raw, plus POD RaceData flags.
 // ---------------------------------------------------------------------------
 
+
+// Toughness MUST come from game APIs — CharStats layout after std::map does not
+// match modern MSVC, so stats->_toughness / raw 0x90 can read STRENGTH instead.
+// STAT_TOUGHNESS = 21 in Kenshi Enums.h
+
+// float CharStats::getStat(StatsEnumerated, bool unmodified) const
+typedef float (*CharStats_getStat_fn)(const CharStats* self, StatsEnumerated what, bool unmodified);
+// float& CharStats::getStatRef(StatsEnumerated)
+typedef float* (*CharStats_getStatRef_fn)(CharStats* self, StatsEnumerated what);
+// float CharStats::toughness() const
+typedef float (*CharStats_toughness_fn)(const CharStats* self);
+
+static CharStats_getStat_fn    g_getStat = nullptr;
+static CharStats_getStatRef_fn g_getStatRef = nullptr;
+static CharStats_toughness_fn  g_toughnessFn = nullptr;
+
+static void ResolveToughnessApi()
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    return;
+#else
+    if (g_getStat && g_getStatRef) return;
+    HMODULE h = GetModuleHandleA("KenshiLib.dll");
+    if (!h) return;
+    auto resolve = [&](const char* mangled) -> void* {
+        void* exp = (void*)GetProcAddress(h, mangled);
+        if (!exp) return nullptr;
+        intptr_t real = KenshiLib::GetRealAddress(exp);
+        return real ? (void*)real : nullptr;
+    };
+    if (!g_getStat)
+        g_getStat = (CharStats_getStat_fn)resolve(
+            "?getStat@CharStats@@QEBAMW4StatsEnumerated@@_N@Z");
+    if (!g_getStatRef)
+        g_getStatRef = (CharStats_getStatRef_fn)resolve(
+            "?getStatRef@CharStats@@QEAAAEAMW4StatsEnumerated@@@Z");
+    if (!g_toughnessFn)
+        g_toughnessFn = (CharStats_toughness_fn)resolve(
+            "?toughness@CharStats@@QEBAMXZ");
+    if (g_getStat) DebugLog("ToughnessFeast: getStat resolved");
+    else ErrorLog("ToughnessFeast: getStat MISSING");
+    if (g_getStatRef) DebugLog("ToughnessFeast: getStatRef resolved");
+    if (g_toughnessFn) DebugLog("ToughnessFeast: toughness() resolved");
+#endif
+}
+
+static float GetToughness(const CharStats* stats)
+{
+    if (!stats) return 0.f;
+    ResolveToughnessApi();
+    float t = -1.f;
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    // 1) getStat unmodified — same source as character sheet numbers
+    if (g_getStat)
+    {
+        t = g_getStat(stats, STAT_TOUGHNESS, true);
+    }
+    // 2) toughness() accessor
+    if ((t != t || t < 0.f || t > 500.f) && g_toughnessFn)
+    {
+        t = g_toughnessFn(stats);
+    }
+    // 3) getStatRef
+    if ((t != t || t < 0.f || t > 500.f) && g_getStatRef)
+    {
+        float* pref = g_getStatRef(const_cast<CharStats*>(stats), STAT_TOUGHNESS);
+        if (pref) t = *pref;
+    }
+#endif
+    // 4) last resort: try a few known float offsets and pick plausible
+    //    Prefer NOT 0x80 (strength). Documented toughness is 0x90.
+    if (t != t || t < 0.f || t > 500.f)
+    {
+        static const size_t kTry[] = { 0x90, 0x94, 0x8C, 0x98 };
+        t = 0.f;
+        for (size_t off : kTry)
+        {
+            float v = 0.f;
+            std::memcpy(&v, (const char*)(const void*)stats + off, sizeof(v));
+            if (v == v && v >= 0.f && v <= 200.f)
+            {
+                // Prefer values that look like whole-ish skill levels
+                t = v;
+                if (v >= 1.f) break;
+            }
+        }
+    }
+    if (t != t || t < 0.f) t = 0.f;
+    if (t > 500.f) t = 500.f;
+    return t;
+}
+
+static void SetToughness(CharStats* stats, float t)
+{
+    if (!stats) return;
+    if (t != t) return;
+    if (t < 0.f) t = 0.f;
+    if (t > 500.f) t = 500.f;
+    ResolveToughnessApi();
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    if (g_getStatRef)
+    {
+        float* pref = g_getStatRef(stats, STAT_TOUGHNESS);
+        if (pref)
+        {
+            *pref = t;
+            return;
+        }
+    }
+#endif
+    // Fallback write documented offset only (never 0x80 strength)
+    std::memcpy((char*)(void*)stats + 0x90, &t, sizeof(float));
+}
+
+static MedicalSystem* GetMedical(CharStats* stats)
+{
+    if (!stats) return nullptr;
+    return stats->medical; // offset 0x8 — before map, safe
+}
+
+
 enum RaceKind
 {
     RACE_UNKNOWN = 0,
@@ -478,7 +599,7 @@ static float RegenPowerOf(CharStats* stats)
 {
     if (!stats) return 0.f;
     float un = FoodRegenStartFor(stats);
-    float tough = stats->_toughness;
+    float tough = GetToughness(stats);
     if (tough <= un || un >= 9000.f) return 0.f;
     float pwr = (tough - un) * FoodRegenScaleFor(stats);
     if (pwr > 3.5f) pwr = 3.5f;
@@ -531,6 +652,34 @@ struct LimbTip
     int active;       // needs attention
 };
 
+static MedicalSystem::HealthPartStatus* ResolveLimbPart(MedicalSystem* med, int slot)
+{
+    // slot: 0 LArm 1 RArm 2 LLeg 3 RLeg
+    if (!med) return nullptr;
+    static const RobotLimbs::Limb kLimbs[4] = {
+        RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
+        RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
+    };
+    MedicalSystem::HealthPartStatus* part = med->getPart(kLimbs[slot]);
+    if (part) return part;
+
+    // PartType + side (more reliable for legs on some races)
+    using PT = MedicalSystem::HealthPartStatus::PartType;
+    if (slot == 0) part = med->getPart(PT::PART_ARM, SIDE_LEFT);
+    else if (slot == 1) part = med->getPart(PT::PART_ARM, SIDE_RIGHT);
+    else if (slot == 2) part = med->getPart(PT::PART_LEG, SIDE_LEFT);
+    else if (slot == 3) part = med->getPart(PT::PART_LEG, SIDE_RIGHT);
+    if (part) return part;
+
+    // Raw MedicalSystem limb pointers
+    static const int kOff[4] = { 0x90, 0x98, 0x80, 0x88 }; // LArm RArm LLeg RLeg
+    MedicalSystem::HealthPartStatus* raw = nullptr;
+    std::memcpy(&raw, (const char*)(void*)med + kOff[slot], sizeof(raw));
+    if (raw && (uintptr_t)raw > 0x10000ull)
+        return raw;
+    return nullptr;
+}
+
 static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
 {
     if (!stats || !out || maxOut <= 0) return 0;
@@ -541,27 +690,12 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
     __try
     {
 #endif
-    // Prefer getPart(enum) — safer than raw limb pointer offsets
-    static const RobotLimbs::Limb kLimbs[4] = {
-        RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
-        RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
-    };
     static const char* kNames[4] = { "Left Arm", "Right Arm", "Left Leg", "Right Leg" };
 
     int n = 0;
     for (int i = 0; i < 4 && n < maxOut; ++i)
     {
-        MedicalSystem::HealthPartStatus* part = med->getPart(kLimbs[i]);
-        // Fallback raw pointers only if getPart null
-        if (!part)
-        {
-            MedicalSystem::HealthPartStatus* raw = nullptr;
-            // leftArm 0x90, rightArm 0x98, leftLeg 0x80, rightLeg 0x88
-            static const int kOff[4] = { 0x90, 0x98, 0x80, 0x88 };
-            std::memcpy(&raw, (const char*)(void*)med + kOff[i], sizeof(raw));
-            if (raw && (uintptr_t)raw > 0x10000ull)
-                part = raw;
-        }
+        MedicalSystem::HealthPartStatus* part = ResolveLimbPart(med, i);
 
         LimbTip& tip = out[n];
         std::memset(&tip, 0, sizeof(tip));
@@ -706,7 +840,7 @@ static void RefreshTfLiveStatus(CharStats* stats)
 {
     if (!stats) return;
     std::memset(&g_tfLive, 0, sizeof(g_tfLive));
-    g_tfLive.toughness = stats->_toughness;
+    g_tfLive.toughness = GetToughness(stats);
     g_tfLive.unlock = FoodRegenStartFor(stats);
     g_tfLive.power = RegenPowerOf(stats);
     g_tfLive.foodUse = FoodUsePercentPerSec(stats);
@@ -743,17 +877,14 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
 
     StripPreviousTfBlock(dats);
 
-    // Always carve 12 free slots from the end so all 4 limbs + live tgh fit.
-    // Hunger tip can afford to drop a few vanilla trailing lines.
-    const unsigned kNeed = 12;
-    if (dats->maxSize >= kNeed)
-    {
-        unsigned maxKeep = dats->maxSize - kNeed;
-        if (dats->count > maxKeep)
-            dats->count = maxKeep;
-    }
+    // Carve free slots for full panel (4 limbs). Even small lektors get room.
+    unsigned kNeed = 14;
+    if (kNeed + 2 > dats->maxSize)
+        kNeed = dats->maxSize > 4 ? dats->maxSize - 2 : 0;
+    if (kNeed > 0 && dats->count + kNeed > dats->maxSize)
+        dats->count = dats->maxSize - kNeed;
 
-    const unsigned kBudget = 14;
+    const unsigned kBudget = 16;
     unsigned startCount = dats->count;
     auto room = [&]() -> int {
         if (dats->count >= dats->maxSize) return 0;
@@ -766,7 +897,7 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
     };
 
     // LIVE toughness every hover (do not cache)
-    float toughNow = stats->_toughness;
+    float toughNow = GetToughness(stats);
     if (toughNow != toughNow || toughNow < 0.f) toughNow = 0.f;
     if (toughNow > 500.f) toughNow = 500.f;
 
@@ -800,8 +931,10 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
     }
     {
         char r[40];
-        // two decimals so gains are visible each hover
-        std::snprintf(r, sizeof(r), "%.2f (cap %.0f)", toughNow, g_cfg.combatCapToughness);
+        // Integer like HUD (no fake decimals from wrong field)
+        int tInt = (int)(toughNow + 0.5f);
+        if (tInt < 0) tInt = 0;
+        std::snprintf(r, sizeof(r), "%d (cap %.0f)", tInt, g_cfg.combatCapToughness);
         line("Toughness", r);
     }
     if (hungerPct >= 0.f)
@@ -853,7 +986,7 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
     {
         char mbuf[160];
         std::snprintf(mbuf, sizeof(mbuf),
-            "ToughnessFeast: tip t=%.2f p=%.2f limbs=%d max=%u",
+            "ToughnessFeast: tip t=%.1f p=%.2f limbs=%d max=%u",
             toughNow, pwr, n, (unsigned)dats->maxSize);
         DebugLog(mbuf);
     }
@@ -895,11 +1028,11 @@ static void MaybeLogStatus(CharStats* stats)
     char shortLog[192];
     float un = FoodRegenStartFor(stats);
     float pwr = 0.f;
-    if (stats->_toughness > un && un < 9000.f)
-        pwr = (stats->_toughness - un) * FoodRegenScaleFor(stats);
+    if (GetToughness(stats) > un && un < 9000.f)
+        pwr = (GetToughness(stats) - un) * FoodRegenScaleFor(stats);
     std::snprintf(shortLog, sizeof(shortLog),
         "TF [%s] t=%.1f unlock=%.0f p=%.2f",
-        RaceKindName(rk), stats->_toughness, un, pwr);
+        RaceKindName(rk), GetToughness(stats), un, pwr);
     DebugLog(shortLog);
 }
 
@@ -913,7 +1046,7 @@ static void RefreshStatusHud(CharStats* preferStats)
 static float RegenPowerFromStats(CharStats* stats)
 {
     if (!stats) return 0.f;
-    float tough = stats->_toughness;
+    float tough = GetToughness(stats);
     if (tough < 0.f || tough > 500.f) return 0.f;
     float excess = tough - FoodRegenStartFor(stats);
     if (excess <= 0.f) return 0.f;
@@ -961,43 +1094,45 @@ static void ProcessLimbRegrowth(
     float frameTime,
     float& hungerCost,
     int& anyHeal,
-    float& worstSeverity) // 0 healthy .. 1 catastrophic
+    float& worstSeverity)
 {
     if (!med || !stats || !g_cfg.enableLimbRestore) return;
     if (power <= 0.f) return;
 
     RobotLimbs* robots = med->robotLimbs;
-    if (!robots) return;
+    // robots may be null early; still try flesh bud via ResolveLimbPart
+    float regrowBudget = g_cfg.limbRegrowPerSecond * power * frameTime;
+    if (regrowBudget <= 0.f) return;
 
-    // Order matches RobotLimbs::Limb enum
     static const RobotLimbs::Limb kLimbs[4] = {
-        RobotLimbs::LEFT_ARM,
-        RobotLimbs::RIGHT_ARM,
-        RobotLimbs::LEFT_LEG,
-        RobotLimbs::RIGHT_LEG
+        RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
+        RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
     };
 
-    float regrowBudget = g_cfg.limbRegrowPerSecond * power * frameTime;
-
+#if defined(_MSC_VER)
+    __try
+    {
+#endif
     for (int i = 0; i < 4; ++i)
     {
         RobotLimbs::Limb limbEnum = kLimbs[i];
-        MedicalSystem::HealthPartStatus* part = med->getPart(limbEnum);
+        MedicalSystem::HealthPartStatus* part = ResolveLimbPart(med, i);
         if (!part) continue;
-        if (part->isRobotic()) continue; // never touch prosthetics
+        if (part->isRobotic()) continue;
 
         LimbState state = part->getRobotLimbState();
-        // Cross-check robotLimbs table when available
-        LimbState tableState = robots->getState(limbEnum);
-        if (tableState == LIMB_REPLACED) continue;
-        if (state == LIMB_REPLACED) continue;
+        LimbState tableState = state;
+        if (robots)
+            tableState = robots->getState(limbEnum);
+        if (state == LIMB_REPLACED || tableState == LIMB_REPLACED)
+            continue;
 
         float maxHp = part->maxHealth();
         if (maxHp < 1.f) maxHp = part->_maxHealth;
         if (maxHp < 1.f || maxHp > 10000.f) continue;
 
         float flesh = part->flesh;
-        if (flesh != flesh) continue; // NaN
+        if (flesh != flesh) continue;
         if (flesh > maxHp * 3.f) flesh = maxHp;
 
         int missing = (state == LIMB_STUMP || state == LIMB_CRUSHED
@@ -1005,91 +1140,119 @@ static void ProcessLimbRegrowth(
 
         if (missing)
         {
-            // Stage 0–1: budding on stump/crush. Crushed is slower.
             float rate = (state == LIMB_CRUSHED || tableState == LIMB_CRUSHED) ? 0.55f : 1.f;
-            // Severity: full penalty while missing
             if (worstSeverity < 0.95f) worstSeverity = 0.95f;
 
-            if (regrowBudget > 0.f)
+            // Phase A: heal overdamage (negative HP) toward 0 — no setLimb
+            if (flesh < 0.f)
             {
-                // Treat negative/overdamage flesh as 0 for budding
-                if (flesh < 0.f) flesh = 0.f;
-                float target = maxHp * g_cfg.limbBudThreshold;
-                if (target < 5.f) target = maxHp * 0.38f;
-
-                if (flesh < target)
+                float need = -flesh;
+                float take = need;
+                float room = regrowBudget * rate;
+                if (take > room) take = room;
+                if (take > 0.f)
                 {
-                    float need = target - flesh;
-                    float take = need;
-                    float room = regrowBudget * rate;
-                    if (take > room) take = room;
-                    if (take > 0.f)
-                    {
-                        part->flesh = flesh + take;
-                        regrowBudget -= take / (rate > 0.01f ? rate : 1.f);
-                        hungerCost += take * 1.1f; // hungry work
-                        anyHeal = 1;
-                        flesh = part->flesh;
-                    }
-                }
-
-                // Stage 2 trigger: enough bud mass → restore organic limb weak
-                if (flesh >= maxHp * g_cfg.limbBudThreshold * 0.98f)
-                {
-                    robots->setLimb(limbEnum, LIMB_ORIGINAL, nullptr);
-                    float start = maxHp * g_cfg.limbRestoredStartPct;
-                    if (start < 1.f) start = maxHp * 0.16f;
-                    part->flesh = start;
-                    // heavy stun — useless in a fight for a bit
-                    part->fleshStun = maxHp * 0.55f;
-                    part->updateDerivedHealths();
+                    part->flesh = flesh + take;
+                    regrowBudget -= take / (rate > 0.01f ? rate : 1.f);
+                    hungerCost += take * 1.0f;
                     anyHeal = 1;
-                    hungerCost += maxHp * 0.25f;
-                    if (worstSeverity < 0.85f) worstSeverity = 0.85f;
-
-                    if (g_cfg.debugLog)
-                    {
-                        char msg[160];
-                        std::snprintf(msg, sizeof(msg),
-                            "ToughnessFeast: limb RESTORED weak (slot %d) flesh=%.0f/%.0f",
-                            i, start, maxHp);
-                        DebugLog(msg);
-                    }
+                    flesh = part->flesh;
                 }
-                else if (g_cfg.debugLog && flesh > 1.f)
+                continue; // do not restore while still overdamaged
+            }
+
+            // Phase B: bud positive flesh on stump (still STUMP/CRUSHED)
+            float target = maxHp * g_cfg.limbBudThreshold;
+            if (target < 5.f) target = maxHp * 0.38f;
+
+            if (flesh < target && regrowBudget > 0.f)
+            {
+                float need = target - flesh;
+                float take = need;
+                float room = regrowBudget * rate;
+                if (take > room) take = room;
+                if (take > 0.f)
                 {
-                    // occasional bud progress (throttle by flesh crossing 10% steps)
-                    int step = (int)(flesh / maxHp * 10.f);
-                    static int s_lastStep[4] = { -1, -1, -1, -1 };
-                    if (step != s_lastStep[i])
-                    {
-                        s_lastStep[i] = step;
-                        char msg[160];
-                        std::snprintf(msg, sizeof(msg),
-                            "ToughnessFeast: limb BUDDING slot %d %.0f%% (need %.0f%%)",
-                            i, flesh / maxHp * 100.f, g_cfg.limbBudThreshold * 100.f);
-                        DebugLog(msg);
-                    }
+                    // Only write flesh — never updateDerivedHealths on stump (crashy)
+                    part->flesh = flesh + take;
+                    regrowBudget -= take / (rate > 0.01f ? rate : 1.f);
+                    hungerCost += take * 1.1f;
+                    anyHeal = 1;
+                    flesh = part->flesh;
+                }
+            }
+
+            // Phase C: restore organic limb once bud threshold met
+            // setLimb invalidates part* — MUST re-fetch before any further writes
+            if (robots && flesh >= maxHp * g_cfg.limbBudThreshold * 0.98f)
+            {
+                robots->setLimb(limbEnum, LIMB_ORIGINAL, nullptr);
+
+                // Re-resolve AFTER setLimb (old part pointer is dead)
+                part = ResolveLimbPart(med, i);
+                if (!part)
+                {
+                    anyHeal = 1;
+                    if (g_cfg.debugLog)
+                        DebugLog("ToughnessFeast: setLimb ok but part lost");
+                    continue;
+                }
+
+                float start = maxHp * g_cfg.limbRestoredStartPct;
+                if (start < 1.f) start = maxHp * 0.16f;
+                if (start > maxHp * 0.4f) start = maxHp * 0.16f;
+
+                part->flesh = start;
+                if (part->fleshStun < maxHp * 0.4f)
+                    part->fleshStun = maxHp * 0.4f;
+                // Soft derived update only after restore, when part is ORIGINAL
+#if defined(_MSC_VER)
+                __try { part->updateDerivedHealths(); }
+                __except (1) { /* ignore */ }
+#else
+                part->updateDerivedHealths();
+#endif
+                anyHeal = 1;
+                hungerCost += maxHp * 0.25f;
+                if (worstSeverity < 0.85f) worstSeverity = 0.85f;
+
+                if (g_cfg.debugLog)
+                {
+                    char msg[160];
+                    std::snprintf(msg, sizeof(msg),
+                        "ToughnessFeast: limb RESTORED weak slot %d flesh=%.0f/%.0f",
+                        i, start, maxHp);
+                    DebugLog(msg);
+                }
+            }
+            else if (g_cfg.debugLog && flesh > 1.f)
+            {
+                int step = (int)(flesh / maxHp * 10.f);
+                static int s_lastStep[4] = { -1, -1, -1, -1 };
+                if (step != s_lastStep[i])
+                {
+                    s_lastStep[i] = step;
+                    char msg[160];
+                    std::snprintf(msg, sizeof(msg),
+                        "ToughnessFeast: BUDDING slot %d %.0f%% need %.0f%%",
+                        i, flesh / maxHp * 100.f, g_cfg.limbBudThreshold * 100.f);
+                    DebugLog(msg);
                 }
             }
         }
         else if (state == LIMB_ORIGINAL || tableState == LIMB_ORIGINAL)
         {
-            // Stage 3–4: organic limb present — strengthen slowly if weak
             float pct = (maxHp > 0.f) ? (flesh / maxHp) : 1.f;
             if (pct < 0.f) pct = 0.f;
 
             if (pct < g_cfg.limbStrongPct)
             {
-                // Combat severity from how weak the limb still is
                 float sev = 1.f - (pct / (g_cfg.limbStrongPct > 0.1f ? g_cfg.limbStrongPct : 0.72f));
                 if (sev > worstSeverity) worstSeverity = sev;
 
-                // Prefer dedicated slow regrow budget for weak restored limbs
                 if (regrowBudget > 0.f && flesh < maxHp)
                 {
                     float need = maxHp - flesh;
-                    // even slower after restore (consolidation)
                     float take = need;
                     float room = regrowBudget * 0.65f;
                     if (take > room) take = room;
@@ -1099,7 +1262,6 @@ static void ProcessLimbRegrowth(
                         regrowBudget -= take / 0.65f;
                         hungerCost += take * 0.35f;
                         anyHeal = 1;
-                        // clear stun gradually
                         if (part->fleshStun > 0.f)
                         {
                             float st = part->fleshStun;
@@ -1107,16 +1269,19 @@ static void ProcessLimbRegrowth(
                             if (stTake > st) stTake = st;
                             part->fleshStun -= stTake;
                         }
-                        part->updateDerivedHealths();
                     }
                 }
             }
-            else
-            {
-                // healthy limb — no severity from this part
-            }
         }
     }
+#if defined(_MSC_VER)
+    }
+    __except (1)
+    {
+        static int s_once = 0;
+        if (!s_once) { ErrorLog("ToughnessFeast: ProcessLimbRegrowth SEH"); s_once = 1; }
+    }
+#endif
 }
 
 static int g_inFoodRegen = 0;
@@ -1236,7 +1401,7 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
             char msg[160];
             std::snprintf(msg, sizeof(msg),
                 "ToughnessFeast: regen t=%.1f p=%.2f h=%.3f sev=%.2f",
-                stats->_toughness, power, next, worstSeverity);
+                GetToughness(stats), power, next, worstSeverity);
             DebugLog(msg);
         }
     }
@@ -1267,14 +1432,14 @@ static float calculateToughnessDamageResistanceMult_hook(CharStats* self)
     if (!self)
         return calculateToughnessDamageResistanceMult_orig(self);
 
-    float t = self->_toughness;
+    float t = GetToughness(self);
     // Only soft-cap clearly super-human values; leave normal range alone
     if (!(t > g_cfg.combatCapToughness + 0.05f && t < 400.f))
         return calculateToughnessDamageResistanceMult_orig(self);
 
-    self->_toughness = g_cfg.combatCapToughness;
+    SetToughness(self, g_cfg.combatCapToughness);
     float r = calculateToughnessDamageResistanceMult_orig(self);
-    self->_toughness = t;
+    SetToughness(self, t);
     if (r != r) r = calculateToughnessDamageResistanceMult_orig(self); // NaN only
     return r;
 }
@@ -1287,13 +1452,13 @@ static float calculateToughnessWoundDegenerationRate_hook(CharStats* self)
     if (!self)
         return calculateToughnessWoundDegenerationRate_orig(self);
 
-    float t = self->_toughness;
+    float t = GetToughness(self);
     if (!(t > g_cfg.combatCapToughness + 0.05f && t < 400.f))
         return calculateToughnessWoundDegenerationRate_orig(self);
 
-    self->_toughness = g_cfg.combatCapToughness;
+    SetToughness(self, g_cfg.combatCapToughness);
     float r = calculateToughnessWoundDegenerationRate_orig(self);
-    self->_toughness = t;
+    SetToughness(self, t);
     if (r != r) r = calculateToughnessWoundDegenerationRate_orig(self);
     return r;
 }
@@ -1311,15 +1476,15 @@ static void xpStat_eventBased_hook(CharStats* self, StatsEnumerated st, float am
         xpStat_eventBased_orig(self, st, amount);
         return;
     }
-    float before = self->_toughness;
+    float before = GetToughness(self);
     xpStat_eventBased_orig(self, st, amount);
-    float gained = self->_toughness - before;
+    float gained = GetToughness(self) - before;
     if (before >= 99.5f && gained < amount * 0.02f)
     {
         float over = (before > 100.f) ? (before - 100.f) : 0.f;
         float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
         float forced = amount * mult;
-        if (forced > 0.f) self->_toughness = before + forced;
+        if (forced > 0.f) SetToughness(self, before + forced);
     }
 }
 
@@ -1335,13 +1500,13 @@ static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
 
     if (st == STAT_TOUGHNESS)
     {
-        float before = self->_toughness;
+        float before = GetToughness(self);
         xpStat_timeBased_orig(self, st);
-        if (before >= 99.5f && self->_toughness <= before + 0.0001f)
+        if (before >= 99.5f && GetToughness(self) <= before + 0.0001f)
         {
             float over = (before > 100.f) ? (before - 100.f) : 0.f;
             float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
-            self->_toughness = before + 0.002f * mult;
+            SetToughness(self, before + 0.002f * mult);
         }
     }
     else
@@ -1482,6 +1647,7 @@ static int HookExport(const char* mangled, void* detour, void** original, const 
 static void InstallHooks()
 {
     DebugLog("ToughnessFeast: EnableHooks=1, resolving via KenshiLib exports...");
+    ResolveToughnessApi();
 
     // Combat soft-cap (usually safe)
     HookExport("?calculateToughnessDamageResistanceMult@CharStats@@QEAAMXZ",
