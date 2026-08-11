@@ -30,12 +30,17 @@
 #include <mygui/MyGUI_Window.h>
 #include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_TextBox.h>
+#include <mygui/MyGUI_Button.h>
+#include <mygui/MyGUI_UString.h>
+#include <mygui/MyGUI_Delegate.h>
+#include <mygui/MyGUI_Colour.h>
 #endif
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #ifndef MAX_PATH
 #define MAX_PATH 260
@@ -104,7 +109,7 @@ static Config g_cfg = {
     1,       // enableMedicalHooks
     1,       // enableLimbRestore
     1,       // showStatusHud (deferred create)
-    400      // hudDelayTicks ~ many seconds after in-world
+    120      // hudDelayTicks ~ many seconds after in-world
 };
 
 static char g_pluginDir[MAX_PATH] = { 0 };
@@ -370,10 +375,13 @@ static int g_statusLogCooldown = 0;
 static int g_worldTicks = 0;
 static int g_raceLogged = 0;
 
+static int g_hudFailed = 0;
+static int g_hudUserClosed = 0;
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
 static MyGUI::Window* g_hudWindow = nullptr;
-static MyGUI::EditBox* g_hudEdit = nullptr;
-static int g_hudFailed = 0;
+static MyGUI::Button* g_hudCloseBtn = nullptr;
+static const int kHudLines = 14;
+static MyGUI::TextBox* g_hudLines[kHudLines] = {};
 #endif
 
 static const char* LimbSlotName(int i)
@@ -482,22 +490,86 @@ static void BuildStatusText(CharStats* stats)
     std::snprintf(g_statusText, sizeof(g_statusText), "%s", lines);
 }
 
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+static void OnHudCloseClick(MyGUI::Widget* /*sender*/)
+{
+    g_hudUserClosed = 1;
+    if (g_hudWindow)
+        g_hudWindow->setVisible(false);
+    DebugLog("ToughnessFeast: status menu closed by user");
+}
+
+// Paint status as separate single-line labels (EditBox multi-line was blank in Kenshi)
+static void ApplyHudText()
+{
+    if (!g_hudWindow) return;
+
+    // Split g_statusText into lines
+    const char* s = g_statusText;
+    int line = 0;
+    while (*s && line < kHudLines)
+    {
+        char buf[160];
+        int n = 0;
+        while (s[n] && s[n] != '\n' && n < 150) ++n;
+        if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+        std::memcpy(buf, s, (size_t)n);
+        buf[n] = 0;
+        if (g_hudLines[line])
+        {
+            g_hudLines[line]->setCaption(MyGUI::UString(buf));
+            g_hudLines[line]->setTextColour(MyGUI::Colour(0.95f, 0.96f, 0.80f));
+            g_hudLines[line]->setVisible(true);
+        }
+        s += n;
+        if (*s == '\n') ++s;
+        ++line;
+    }
+    // hide unused lines
+    for (; line < kHudLines; ++line)
+    {
+        if (g_hudLines[line])
+            g_hudLines[line]->setVisible(false);
+    }
+
+    // Title shows race/toughness summary (always readable)
+    char title[96];
+    size_t n = 0;
+    while (g_statusText[n] && g_statusText[n] != '\n' && n < 70) ++n;
+    // prefer second line if first is banner
+    const char* t2 = g_statusText;
+    if (std::strncmp(g_statusText, "===", 3) == 0)
+    {
+        t2 = g_statusText;
+        while (*t2 && *t2 != '\n') ++t2;
+        if (*t2 == '\n') ++t2;
+        n = 0;
+        while (t2[n] && t2[n] != '\n' && n < 70) ++n;
+        std::snprintf(title, sizeof(title), "TF | %.*s", (int)n, t2);
+    }
+    else
+        std::snprintf(title, sizeof(title), "TF | %.*s", (int)n, g_statusText);
+    g_hudWindow->setCaption(MyGUI::UString(title));
+}
+#endif
+
 static void TryCreateStatusMenu()
 {
 #if defined(TOUGHNESSFEAST_LINUX_IDE)
     return;
 #else
     if (!g_cfg.showStatusHud) return;
+    if (g_hudUserClosed) return;
     if (g_hudWindow || g_hudFailed) return;
-    if (g_worldTicks < g_cfg.hudDelayTicks) return; // wait until long after save load
+    if (g_worldTicks < g_cfg.hudDelayTicks) return;
 
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     if (!gui) return;
 
-    // KillButton pattern: layer "Window"
+    // Match KillButton skin/layer exactly (known working)
     g_hudWindow = gui->createWidgetReal<MyGUI::Window>(
         "Kenshi_WindowCX",
-        0.70f, 0.08f, 0.28f, 0.40f,
+        0.66f, 0.05f, 0.32f, 0.48f,
         MyGUI::Align::Default,
         "Window",
         "ToughnessFeastHud");
@@ -507,26 +579,63 @@ static void TryCreateStatusMenu()
         ErrorLog("ToughnessFeast: HUD window create failed");
         return;
     }
-    g_hudWindow->setCaption("Toughness Feast");
+
+    g_hudWindow->setCaption(MyGUI::UString("Toughness Feast"));
     g_hudWindow->setVisible(true);
+    g_hudWindow->setEnabled(true);
 
     MyGUI::Widget* client = g_hudWindow->getClientWidget();
     if (!client) client = g_hudWindow;
 
-    g_hudEdit = client->createWidgetReal<MyGUI::EditBox>(
-        "EditBox",
-        0.03f, 0.03f, 0.94f, 0.94f,
-        MyGUI::Align::Stretch,
-        "TfHudEdit");
-    if (g_hudEdit)
+    // Close button — top right of client area
+    g_hudCloseBtn = client->createWidgetReal<MyGUI::Button>(
+        "Kenshi_Button1",
+        0.70f, 0.01f, 0.28f, 0.07f,
+        MyGUI::Align::Default,
+        "TfHudClose");
+    if (g_hudCloseBtn)
     {
-        g_hudEdit->setEditReadOnly(true);
-        g_hudEdit->setEditMultiLine(true);
-        g_hudEdit->setEditWordWrap(true);
-        g_hudEdit->setCaption(g_statusText);
-        g_hudEdit->setVisible(true);
+        g_hudCloseBtn->setCaption(MyGUI::UString("Close"));
+        g_hudCloseBtn->setVisible(true);
+        g_hudCloseBtn->eventMouseButtonClick += MyGUI::newDelegate(OnHudCloseClick);
     }
-    DebugLog("ToughnessFeast: status menu created (deferred)");
+
+    // One TextBox per line (reliable)
+    for (int i = 0; i < kHudLines; ++i)
+    {
+        float y = 0.09f + (float)i * 0.062f;
+        g_hudLines[i] = client->createWidgetReal<MyGUI::TextBox>(
+            "TextBox",
+            0.03f, y, 0.94f, 0.06f,
+            MyGUI::Align::Default,
+            (std::string("TfHudL") + std::to_string(i)).c_str());
+        if (!g_hudLines[i])
+        {
+            g_hudLines[i] = client->createWidgetReal<MyGUI::TextBox>(
+                "Kenshi_TextBox",
+                0.03f, y, 0.94f, 0.06f,
+                MyGUI::Align::Default,
+                (std::string("TfHudLK") + std::to_string(i)).c_str());
+        }
+        if (g_hudLines[i])
+        {
+            g_hudLines[i]->setVisible(true);
+            g_hudLines[i]->setTextColour(MyGUI::Colour(0.95f, 0.96f, 0.80f));
+            g_hudLines[i]->setCaption(MyGUI::UString("..."));
+        }
+    }
+
+    if (g_lastStats)
+        BuildStatusText(g_lastStats);
+    else
+        std::snprintf(g_statusText, sizeof(g_statusText),
+            "=== Toughness Feast ===\n"
+            "Loading character stats...\n"
+            "Select a squad member.\n"
+            "Click Close to hide this panel.\n");
+
+    ApplyHudText();
+    DebugLog("ToughnessFeast: status menu created (line labels + Close)");
 #endif
 }
 
@@ -539,37 +648,31 @@ static void RefreshStatusHud(CharStats* preferStats)
     ++g_worldTicks;
     BuildStatusText(stats);
 
-    // Log throttle
     if (g_cfg.debugLog)
     {
         if (++g_statusLogCooldown >= 30)
         {
             g_statusLogCooldown = 0;
-            // short one-liner for log
             RaceKind rk = DetectRaceKind(stats);
             char shortLog[256];
+            float un = FoodRegenStartFor(stats);
+            float pwr = 0.f;
+            if (stats->_toughness > un && un < 9000.f)
+                pwr = (stats->_toughness - un) * FoodRegenScaleFor(stats);
             std::snprintf(shortLog, sizeof(shortLog),
                 "TF [%s] t=%.1f unlock=%.0f p=%.2f",
-                RaceKindName(rk), stats->_toughness,
-                FoodRegenStartFor(stats),
-                (stats->_toughness > FoodRegenStartFor(stats))
-                    ? (stats->_toughness - FoodRegenStartFor(stats)) * FoodRegenScaleFor(stats)
-                    : 0.f);
+                RaceKindName(rk), stats->_toughness, un, pwr);
             DebugLog(shortLog);
         }
     }
 
-    // Deferred menu (never during early load)
-    if (g_cfg.showStatusHud)
-    {
-        TryCreateStatusMenu();
+    if (!g_cfg.showStatusHud) return;
+    if (g_hudUserClosed) return; // do not force re-open
+
+    TryCreateStatusMenu();
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
-        if (g_hudEdit)
-            g_hudEdit->setCaption(g_statusText);
-        if (g_hudWindow)
-            g_hudWindow->setVisible(true);
+    ApplyHudText();
 #endif
-    }
 }
 
 static float RegenPowerFromStats(CharStats* stats)
