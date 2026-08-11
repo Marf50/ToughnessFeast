@@ -515,7 +515,15 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
 {
     if (!stats || !out || maxOut <= 0) return 0;
     MedicalSystem* med = stats->medical;
-    if (!med || !med->robotLimbs) return 0;
+    if (!med) return 0;
+
+    // KenshiLib MedicalSystem limb pointers @ 0x80/88/90/98
+    // Read raw so we do not depend on IDE stub fields / robotLimbs.
+    MedicalSystem::HealthPartStatus* parts[4] = { nullptr, nullptr, nullptr, nullptr };
+    std::memcpy(&parts[2], (const char*)(void*)med + 0x80, sizeof(void*)); // leftLeg
+    std::memcpy(&parts[3], (const char*)(void*)med + 0x88, sizeof(void*)); // rightLeg
+    std::memcpy(&parts[0], (const char*)(void*)med + 0x90, sizeof(void*)); // leftArm
+    std::memcpy(&parts[1], (const char*)(void*)med + 0x98, sizeof(void*)); // rightArm
 
     static const RobotLimbs::Limb kLimbs[4] = {
         RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
@@ -526,17 +534,28 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
     int n = 0;
     for (int i = 0; i < 4 && n < maxOut; ++i)
     {
-        MedicalSystem::HealthPartStatus* part = med->getPart(kLimbs[i]);
-        if (!part) continue;
+        MedicalSystem::HealthPartStatus* part = parts[i];
+        // Fall back to getPart(enum) if pointer null/bad
+        if (!part)
+            part = med->getPart(kLimbs[i]);
 
         LimbTip& tip = out[n];
         std::memset(&tip, 0, sizeof(tip));
         std::snprintf(tip.name, sizeof(tip.name), "%s", kNames[i]);
 
+        if (!part)
+        {
+            std::snprintf(tip.stage, sizeof(tip.stage), "n/a");
+            std::snprintf(tip.detail, sizeof(tip.detail), "-");
+            tip.active = 0;
+            ++n;
+            continue;
+        }
+
         if (part->isRobotic())
         {
             std::snprintf(tip.stage, sizeof(tip.stage), "Prosthetic");
-            std::snprintf(tip.detail, sizeof(tip.detail), "Robot limb — TF ignores");
+            std::snprintf(tip.detail, sizeof(tip.detail), "skip");
             tip.active = 0;
             ++n;
             continue;
@@ -546,61 +565,49 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
         float maxHp = part->maxHealth();
         if (maxHp < 1.f) maxHp = part->_maxHealth;
         if (maxHp < 1.f) maxHp = 100.f;
-        float flesh = part->flesh;
-        if (flesh < 0.f) flesh = 0.f;
+        float rawFlesh = part->flesh;
+        if (rawFlesh != rawFlesh) rawFlesh = 0.f;
+        float flesh = rawFlesh > 0.f ? rawFlesh : 0.f;
         float pct = flesh / maxHp;
         if (pct > 1.2f) pct = 1.2f;
 
         if (st == LIMB_STUMP || st == LIMB_CRUSHED)
         {
-            // Use raw flesh for progress (can be negative like UI "-45")
-            float rawFlesh = part->flesh;
-            float progFlesh = rawFlesh > 0.f ? rawFlesh : 0.f;
             float prog = (g_cfg.limbBudThreshold > 0.01f && maxHp > 1.f)
-                ? (progFlesh / maxHp) / g_cfg.limbBudThreshold : 0.f;
+                ? (flesh / maxHp) / g_cfg.limbBudThreshold : 0.f;
             if (prog > 1.f) prog = 1.f;
             if (prog < 0.f) prog = 0.f;
             std::snprintf(tip.stage, sizeof(tip.stage), "%s",
-                st == LIMB_CRUSHED ? "Crushed / budding" : "MISSING / budding");
-            if (rawFlesh < 0.f)
-                std::snprintf(tip.detail, sizeof(tip.detail),
-                    "HP %.0f  bud %.0f%%", rawFlesh, prog * 100.f);
-            else
-                std::snprintf(tip.detail, sizeof(tip.detail),
-                    "bud %.0f%% to restore", prog * 100.f);
+                st == LIMB_CRUSHED ? "Crushed" : "MISSING");
+            std::snprintf(tip.detail, sizeof(tip.detail),
+                "bud%.0f HP%.0f", prog * 100.f, rawFlesh);
             tip.active = 1;
         }
         else if (st == LIMB_REPLACED)
         {
             std::snprintf(tip.stage, sizeof(tip.stage), "Replaced");
-            std::snprintf(tip.detail, sizeof(tip.detail), "Not organic regrow");
+            std::snprintf(tip.detail, sizeof(tip.detail), "no regrow");
             tip.active = 0;
         }
-        else // ORIGINAL
+        else
         {
+            // Always list ORIGINAL limbs so all 4 appear
             if (pct < g_cfg.limbRestoredStartPct + 0.08f)
             {
-                std::snprintf(tip.stage, sizeof(tip.stage), "Just restored");
-                std::snprintf(tip.detail, sizeof(tip.detail),
-                    "Fragile - HP %.0f%%", pct * 100.f);
+                std::snprintf(tip.stage, sizeof(tip.stage), "Fragile");
+                std::snprintf(tip.detail, sizeof(tip.detail), "HP%.0f%%", pct * 100.f);
                 tip.active = 1;
             }
             else if (pct < g_cfg.limbStrongPct)
             {
-                float span = g_cfg.limbStrongPct - g_cfg.limbRestoredStartPct;
-                float prog = span > 0.01f ? (pct - g_cfg.limbRestoredStartPct) / span : 0.f;
-                if (prog < 0.f) prog = 0.f;
-                if (prog > 1.f) prog = 1.f;
-                std::snprintf(tip.stage, sizeof(tip.stage), "Strengthening");
-                std::snprintf(tip.detail, sizeof(tip.detail),
-                    "HP %.0f%%  (%.0f%% to strong)", pct * 100.f, prog * 100.f);
+                std::snprintf(tip.stage, sizeof(tip.stage), "Healing");
+                std::snprintf(tip.detail, sizeof(tip.detail), "HP%.0f%%", pct * 100.f);
                 tip.active = 1;
             }
             else
             {
-                std::snprintf(tip.stage, sizeof(tip.stage), "Healthy");
-                std::snprintf(tip.detail, sizeof(tip.detail),
-                    "HP %.0f%% - ready", pct * 100.f);
+                std::snprintf(tip.stage, sizeof(tip.stage), "OK");
+                std::snprintf(tip.detail, sizeof(tip.detail), "HP%.0f%%", pct * 100.f);
                 tip.active = 0;
             }
         }
@@ -626,7 +633,6 @@ static void StripPreviousTfBlock(lektor<StringPair>* dats)
     for (unsigned i = 0; i < n; ++i)
     {
         const char* base = (const char*)(void*)dats->stuff + (size_t)i * kPair;
-        // left string @ +0x8 inside StringPair
         const unsigned char* sp = (const unsigned char*)base + 0x8;
         size_t size = 0, res = 0;
         std::memcpy(&size, sp + 16, sizeof(size));
@@ -636,17 +642,18 @@ static void StripPreviousTfBlock(lektor<StringPair>* dats)
         if (res < 16u) data = (const char*)sp;
         else std::memcpy(&data, sp, sizeof(data));
         if (!data) continue;
-        // Match our headers
         if (std::strncmp(data, "== Toughness Feast", 18) == 0
             || std::strncmp(data, "========", 8) == 0
-            || std::strncmp(data, "Toughness Feast", 15) == 0)
+            || std::strncmp(data, "Toughness Feast", 15) == 0
+            || std::strncmp(data, "-- Limbs --", 11) == 0)
         {
-            dats->count = i; // drop TF block and anything we appended after
+            dats->count = i;
             return;
         }
     }
 #endif
 }
+
 
 
 // Live TF status snapshot (updated from regen tick — tooltips read this so numbers stay current)
@@ -702,17 +709,22 @@ static void RefreshTfLiveStatus(CharStats* stats)
 static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
 {
     if (!dats || !stats) return;
-    if (!dats->stuff || dats->maxSize < 4) return;
+    if (!dats->stuff || dats->maxSize < 8) return;
 
-    // Remove last TF block so re-hover / re-build shows fresh numbers
     StripPreviousTfBlock(dats);
 
-    // Pull latest medical numbers right now (not from first load)
-    RefreshTfLiveStatus(stats);
+    // Always carve 12 free slots from the end so all 4 limbs + live tgh fit.
+    // Hunger tip can afford to drop a few vanilla trailing lines.
+    const unsigned kNeed = 12;
+    if (dats->maxSize >= kNeed)
+    {
+        unsigned maxKeep = dats->maxSize - kNeed;
+        if (dats->count > maxKeep)
+            dats->count = maxKeep;
+    }
 
-    const unsigned kBudget = 16;
+    const unsigned kBudget = 14;
     unsigned startCount = dats->count;
-
     auto room = [&]() -> int {
         if (dats->count >= dats->maxSize) return 0;
         if (dats->count - startCount >= kBudget) return 0;
@@ -723,13 +735,23 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
         LektorAppendPair(dats, a, b);
     };
 
+    // LIVE toughness every hover (do not cache)
+    float toughNow = stats->_toughness;
+    if (toughNow != toughNow || toughNow < 0.f) toughNow = 0.f;
+    if (toughNow > 500.f) toughNow = 500.f;
+
     float un = FoodRegenStartFor(stats);
-    float pwr = RegenPowerOf(stats);
-    float foodUse = FoodUsePercentPerSec(stats);
+    float scale = FoodRegenScaleFor(stats);
+    float pwr = 0.f;
+    if (toughNow > un && un < 9000.f)
+    {
+        pwr = (toughNow - un) * scale;
+        if (pwr > 3.5f) pwr = 3.5f;
+    }
+    float foodUse = (pwr > 0.f) ? (g_cfg.hungerDrainPerSecond * pwr * 100.f) : 0.f;
+
     RaceKind rk = DetectRaceKind(stats);
     MedicalSystem* med = stats->medical;
-
-    // Live hunger read every call
     float hungerPct = -1.f;
     if (med && !med->dead)
     {
@@ -748,30 +770,27 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
     }
     {
         char r[40];
-        std::snprintf(r, sizeof(r), "%.1f (cap %.0f)", stats->_toughness, g_cfg.combatCapToughness);
+        // two decimals so gains are visible each hover
+        std::snprintf(r, sizeof(r), "%.2f (cap %.0f)", toughNow, g_cfg.combatCapToughness);
         line("Toughness", r);
     }
     if (hungerPct >= 0.f)
     {
         char r[40];
         std::snprintf(r, sizeof(r), "%.0f%%", hungerPct);
-        line("Hunger now", r);
+        line("Hunger", r);
     }
-
     if (pwr <= 0.f)
     {
-        line("Food regen", "LOCKED");
         char r[40];
-        std::snprintf(r, sizeof(r), "need %.0f tgh", un);
-        line("Unlock at", r);
+        std::snprintf(r, sizeof(r), "LOCK need %.0f", un);
+        line("Food regen", r);
     }
     else
     {
         char r[40];
-        std::snprintf(r, sizeof(r), "ON pwr %.2f", pwr);
+        std::snprintf(r, sizeof(r), "ON p%.2f ~%.1f%%/s", pwr, foodUse);
         line("Food regen", r);
-        std::snprintf(r, sizeof(r), "~%.2f%%/s", foodUse);
-        line("Food drain", r);
     }
 
     LimbTip limbs[4];
@@ -780,33 +799,32 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
         n = CollectLimbTips(stats, limbs, 4);
 
     int active = 0;
-    if (n > 0)
-        line("-- Limbs --", "stage");
-    for (int i = 0; i < n; ++i)
+    line("-- Limbs --", "all 4");
+    if (n <= 0)
+        line("Limbs", "no data");
+    else
     {
-        if (limbs[i].active) ++active;
-        line(limbs[i].name, limbs[i].stage);
-        if (limbs[i].active)
-            line(" ", limbs[i].detail);
-    }
-    if (n > 0)
-    {
+        for (int i = 0; i < n; ++i)
+        {
+            if (limbs[i].active) ++active;
+            char right[56];
+            std::snprintf(right, sizeof(right), "%s %s", limbs[i].stage, limbs[i].detail);
+            line(limbs[i].name, right);
+        }
         char r[40];
         if (active <= 0) std::snprintf(r, sizeof(r), "all OK");
         else std::snprintf(r, sizeof(r), "%d healing", active);
         line("Summary", r);
     }
-
     line("== end TF ==", "-");
 
-    // Log every ~15 tip rebuilds so we can see values changing
     static int s_tipLog = 0;
-    if (g_cfg.debugLog && ((++s_tipLog) % 15) == 1)
+    if (g_cfg.debugLog && ((++s_tipLog) % 5) == 1)
     {
-        char mbuf[128];
+        char mbuf[160];
         std::snprintf(mbuf, sizeof(mbuf),
-            "ToughnessFeast: tip refresh t=%.1f p=%.2f h=%.0f limbs=%d",
-            stats->_toughness, pwr, hungerPct, active);
+            "ToughnessFeast: tip t=%.2f p=%.2f limbs=%d max=%u",
+            toughNow, pwr, n, (unsigned)dats->maxSize);
         DebugLog(mbuf);
     }
 }
