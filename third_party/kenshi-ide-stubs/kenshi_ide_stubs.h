@@ -48,6 +48,8 @@ class Character {
 public:
   bool amSomeoneWhoNeedsToEatToLive(){return true;}
   RaceData* getRace()const{return nullptr;}
+  CharStats* stats=nullptr;
+  CharStats* getStats(){return stats;}
 };
 class RobotLimbs {
 public:
@@ -92,3 +94,43 @@ public:
   HealthPartStatus* getPart(RobotLimbs::Limb){return nullptr;}
   void medicalUpdate(float){}
 };
+
+// MyGUI / game globals stubs for IDE
+namespace MyGUI {
+struct Colour { Colour(float=1,float=1,float=1,float=1){} };
+struct Align { enum Enum { Default=0, Left=1, Top=2, Stretch=4, Center=8 }; };
+inline Align::Enum operator|(Align::Enum a, Align::Enum b){return (Align::Enum)((int)a|(int)b);}
+class Widget;
+typedef Widget* WidgetPtr;
+class Widget { public: virtual ~Widget(){} };
+class TextBox : public Widget {
+public:
+  void setCaption(const char*){}
+  void setTextAlign(int){}
+  void setTextColour(Colour){}
+};
+class Window : public Widget {
+public:
+  void setCaption(const char*){}
+  void setMinSize(int,int){}
+  Widget* getClientWidget(){return nullptr;}
+};
+class Gui {
+public:
+  static Gui* getInstancePtr(){return nullptr;}
+  template<class T> T* createWidgetReal(const char*, float,float,float,float, int, const char*, const char* =nullptr){return nullptr;}
+};
+}
+class hand {
+public:
+  Character* getCharacter()const{return nullptr;}
+};
+class PlayerInterface {
+public:
+  hand selectedCharacter;
+};
+class GameWorld {
+public:
+  PlayerInterface* player=nullptr;
+};
+static GameWorld* ou = nullptr;
