@@ -606,14 +606,14 @@ static int g_tooltipOnce = 0;
 
 // All TF info lives here (body-part ToolTip hooks crashed the game).
 // Keep lines short; left/right columns stay readable in Kenshi tooltips.
-static void AppendToughnessTooltips(lektor<StringPair>* dats, CharStats* stats)
+static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
 {
     if (!dats || !stats) return;
 
     if (!g_tooltipOnce)
     {
         char m[128];
-        std::snprintf(m, sizeof(m), "ToughnessFeast: toughness tip count=%u max=%u",
+        std::snprintf(m, sizeof(m), "ToughnessFeast: hunger TF tip count=%u max=%u",
             (unsigned)dats->count, (unsigned)dats->maxSize);
         DebugLog(m);
         g_tooltipOnce = 1;
@@ -638,6 +638,7 @@ static void AppendToughnessTooltips(lektor<StringPair>* dats, CharStats* stats)
 
     // ---- header ----
     LektorAppendPair(dats, "========", "Toughness Feast");
+    // (shown on food/hunger hover — toughness hook crashes)
     {
         char r[64];
         const char* race = RaceKindName(rk);
@@ -728,7 +729,7 @@ static void AppendToughnessTooltips(lektor<StringPair>* dats, CharStats* stats)
         if (count > 32) count = 32;
 
         int shown = 0;
-        for (int i = 0; i < count && shown < 8; ++i)
+        for (int i = 0; i < count && shown < 6; ++i)
         {
             MedicalSystem::HealthPartStatus* part = med->getPart((unsigned long long)i);
             if (!part) continue;
@@ -808,20 +809,10 @@ static void AppendToughnessTooltips(lektor<StringPair>* dats, CharStats* stats)
 
 static void AppendHungerTooltips(lektor<StringPair>* dats, CharStats* stats)
 {
-    if (!dats || !stats) return;
-    float pwr = RegenPowerOf(stats);
-    float foodUse = FoodUsePercentPerSec(stats);
-    LektorAppendPair(dats, "Toughness Feast", "food");
-    if (pwr <= 0.f)
-        LektorAppendPair(dats, "Limb regen", "LOCKED - see Toughness");
-    else
-    {
-        char r[64];
-        std::snprintf(r, sizeof(r), "ON  ~%.1f%%/sec", foodUse);
-        LektorAppendPair(dats, "Food for limbs", r);
-        LektorAppendPair(dats, "Full details", "hover Toughness");
-    }
+    // Hunger tooltip path is stable; put the whole TF panel here.
+    AppendFullTfTooltips(dats, stats);
 }
+
 
 // Still build short log line (no GUI)
 static CharStats* g_lastStats = nullptr;
@@ -1316,24 +1307,6 @@ static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
 // ---------------------------------------------------------------------------
 
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
-static bool (*getStatPenaltiesForGUI_orig)(CharStats*, const std::string&, StatsEnumerated, lektor<StringPair>&) = nullptr;
-static bool getStatPenaltiesForGUI_hook(CharStats* self, const std::string& statName, StatsEnumerated stat, lektor<StringPair>& dats)
-{
-    bool r = false;
-    if (getStatPenaltiesForGUI_orig)
-        r = getStatPenaltiesForGUI_orig(self, statName, stat, dats);
-    // Do not read statName (CRT ABI). Use enum only.
-    // Never permanently block tooltips on regen flag (could stick after crash).
-    if (g_cfg.enableTooltips && self)
-    {
-        g_lastStats = self;
-        g_inFoodRegen = 0;
-        if (stat == STAT_TOUGHNESS)
-            AppendToughnessTooltips(&dats, self);
-    }
-    return r;
-}
-
 static void (*printExertionHungerMultTooltip_orig)(CharStats*, lektor<StringPair>*) = nullptr;
 static void printExertionHungerMultTooltip_hook(CharStats* self, lektor<StringPair>* dats)
 {
@@ -1342,7 +1315,9 @@ static void printExertionHungerMultTooltip_hook(CharStats* self, lektor<StringPa
     if (g_cfg.enableTooltips && self && dats)
     {
         g_lastStats = self;
-        AppendHungerTooltips(dats, self);
+        g_inFoodRegen = 0;
+        // Full panel here — toughness getStatPenalties path crashes
+        AppendFullTfTooltips(dats, self);
     }
 }
 #endif
@@ -1458,12 +1433,7 @@ static void InstallHooks()
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
     if (g_cfg.enableTooltips)
     {
-        // getStatPenaltiesForGUI — toughness (and other stats) hover
-        HookExport(
-            "?getStatPenaltiesForGUI@CharStats@@QEAA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@W4StatsEnumerated@@AEAV?$lektor@VStringPair@@@@@Z",
-            (void*)getStatPenaltiesForGUI_hook,
-            (void**)&getStatPenaltiesForGUI_orig,
-            "ToughnessFeast: hooked toughness tooltips");
+        // getStatPenaltiesForGUI NOT hooked (crashes); all TF info on hunger tooltip.
         HookExport(
             "?printExertionHungerMultTooltip@CharStats@@QEAAXPEAV?$lektor@VStringPair@@@@@Z",
             (void*)printExertionHungerMultTooltip_hook,
