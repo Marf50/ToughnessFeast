@@ -21,6 +21,7 @@
 #include <kenshi/RaceData.h>
 #endif
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -394,11 +395,46 @@ static void medicalUpdate_hook(MedicalSystem* self, float frameTime)
     ApplyFoodRegen(self, frameTime);
 }
 
+// ---------------------------------------------------------------------------
+// Resolve game functions via RVA (from KenshiLib headers for this game build).
+// GetRealAddress(&Class::method) asserts under VS2022 unless LTCG is perfect:
+//   "address appears to be in your own module"
+// RVAs below match KenshiLib_Examples_deps headers (1.0.5x / RE_Kenshi 0.3.x).
+// ---------------------------------------------------------------------------
+
+// public RVA comments from CharStats.h / MedicalSystem.h
+static const uintptr_t RVA_calculateToughnessDamageResistanceMult = 0x643FF0;
+static const uintptr_t RVA_calculateToughnessWoundDegenerationRate = 0x6434F0;
+static const uintptr_t RVA_xpStat_eventBased                       = 0x8C5B60;
+static const uintptr_t RVA_xpStat_timeBased                        = 0x8C5AA0;
+static const uintptr_t RVA_medicalUpdate                           = 0x651880;
+
+static void* KenshiExeBase()
+{
+    static void* base = nullptr;
+    if (base) return base;
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    base = (void*)GetModuleHandleA("kenshi_x64.exe");
+    if (!base) base = (void*)GetModuleHandleA("Kenshi_x64.exe");
+    if (!base) base = (void*)GetModuleHandleA(nullptr); // host process
+#else
+    base = (void*)0x400000;
+#endif
+    return base;
+}
+
+static void* AtRva(uintptr_t rva)
+{
+    void* b = KenshiExeBase();
+    if (!b) return nullptr;
+    return (void*)((uintptr_t)b + rva);
+}
+
 static int TryAddHook(void* target, void* detour, void** original, const char* okMsg)
 {
     if (!target)
     {
-        ErrorLog("ToughnessFeast: null GetRealAddress");
+        ErrorLog("ToughnessFeast: null target address");
         ErrorLog(okMsg);
         return 0;
     }
@@ -414,24 +450,29 @@ static int TryAddHook(void* target, void* detour, void** original, const char* o
 
 static void InstallHooks()
 {
-    DebugLog("ToughnessFeast: EnableHooks=1, installing...");
-    TryAddHook((void*)KenshiLib::GetRealAddress(&CharStats::calculateToughnessDamageResistanceMult),
+    DebugLog("ToughnessFeast: EnableHooks=1, installing via RVA...");
+
+    char msg[128];
+    std::snprintf(msg, sizeof(msg), "ToughnessFeast: kenshi base %p", KenshiExeBase());
+    DebugLog(msg);
+
+    TryAddHook(AtRva(RVA_calculateToughnessDamageResistanceMult),
                (void*)calculateToughnessDamageResistanceMult_hook,
                (void**)&calculateToughnessDamageResistanceMult_orig,
                "ToughnessFeast: hooked DR");
-    TryAddHook((void*)KenshiLib::GetRealAddress(&CharStats::calculateToughnessWoundDegenerationRate),
+    TryAddHook(AtRva(RVA_calculateToughnessWoundDegenerationRate),
                (void*)calculateToughnessWoundDegenerationRate_hook,
                (void**)&calculateToughnessWoundDegenerationRate_orig,
                "ToughnessFeast: hooked wound degen");
-    TryAddHook((void*)KenshiLib::GetRealAddress(&CharStats::xpStat_eventBased),
+    TryAddHook(AtRva(RVA_xpStat_eventBased),
                (void*)xpStat_eventBased_hook,
                (void**)&xpStat_eventBased_orig,
                "ToughnessFeast: hooked xp event");
-    TryAddHook((void*)KenshiLib::GetRealAddress(&CharStats::xpStat_timeBased),
+    TryAddHook(AtRva(RVA_xpStat_timeBased),
                (void*)xpStat_timeBased_hook,
                (void**)&xpStat_timeBased_orig,
                "ToughnessFeast: hooked xp time");
-    TryAddHook((void*)KenshiLib::GetRealAddress(&MedicalSystem::medicalUpdate),
+    TryAddHook(AtRva(RVA_medicalUpdate),
                (void*)medicalUpdate_hook,
                (void**)&medicalUpdate_orig,
                "ToughnessFeast: hooked medicalUpdate");

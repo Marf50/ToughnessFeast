@@ -83,7 +83,11 @@ if(_GAME_BUILD)
 
   if(MSVC)
     set_property(TARGET ToughnessFeast PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
-    target_compile_options(ToughnessFeast PRIVATE /W3 /EHsc /bigobj)
+    # Whole program optimization required by KenshiLib::GetRealAddress for member ptrs
+    # (we also use RVA hooks; LTCG still recommended)
+    target_compile_options(ToughnessFeast PRIVATE /W3 /EHsc /bigobj /GL /O2)
+    target_link_options(ToughnessFeast PRIVATE /LTCG /INCREMENTAL:NO)
+    set_property(TARGET ToughnessFeast PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
   endif()
 
   # Link KenshiLib (filename case varies)
