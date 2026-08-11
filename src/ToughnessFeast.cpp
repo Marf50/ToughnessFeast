@@ -66,6 +66,9 @@ struct Config
     float limbRegrowPerSecond;
     float past100XpMult;
     bool debugLog;
+    // Test start: floor player toughness so food-regen is immediately usable
+    bool enableTestStart;
+    float testStartToughness;
 };
 
 static Config g_cfg = {
@@ -79,7 +82,9 @@ static Config g_cfg = {
     true,   // healUnhealable
     0.15f,  // limbRegrowPerSecond
     0.18f,  // past100XpMult
-    false   // debugLog
+    false,  // debugLog
+    true,   // enableTestStart (ON for easy testing — set 0 in config.ini to disable)
+    75.f    // testStartToughness
 };
 
 static std::string Trim(const std::string& s)
@@ -139,12 +144,15 @@ static void LoadConfig()
         else if (key == "LimbRegrowPerSecond") g_cfg.limbRegrowPerSecond = (float)std::atof(val.c_str());
         else if (key == "Past100XpMult") g_cfg.past100XpMult = (float)std::atof(val.c_str());
         else if (key == "DebugLog") g_cfg.debugLog = ParseBool(val);
+        else if (key == "EnableTestStart") g_cfg.enableTestStart = ParseBool(val);
+        else if (key == "TestStartToughness") g_cfg.testStartToughness = (float)std::atof(val.c_str());
     }
 
-    char msg[256];
+    char msg[320];
     std::snprintf(msg, sizeof(msg),
-        "ToughnessFeast: config loaded (cap=%.0f start=%.0f scale=%.3f)",
-        g_cfg.combatCapToughness, g_cfg.foodRegenStart, g_cfg.foodRegenScalePerPoint);
+        "ToughnessFeast: config loaded (cap=%.0f regenStart=%.0f testStart=%s@%.0f)",
+        g_cfg.combatCapToughness, g_cfg.foodRegenStart,
+        g_cfg.enableTestStart ? "ON" : "off", g_cfg.testStartToughness);
     DebugLog(msg);
 }
 
@@ -250,6 +258,37 @@ static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
         float over = (before > 100.f) ? (before - 100.f) : 0.f;
         float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
         self->_toughness = before + 0.002f * mult;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test start: floor player toughness so regen unlocks immediately
+// ---------------------------------------------------------------------------
+
+static void ApplyTestStartToughness(MedicalSystem* med)
+{
+    if (!g_cfg.enableTestStart) return;
+    if (g_cfg.testStartToughness <= 0.f) return;
+    if (!med || med->dead) return;
+
+    CharStats* stats = med->stats;
+    Character* me = med->me;
+    if (!stats || !me) return;
+    if (!me->isPlayerCharacter()) return;
+
+    // Only raise — never lower a character already above the test floor
+    if (stats->_toughness + 0.01f < g_cfg.testStartToughness)
+    {
+        float before = stats->_toughness;
+        stats->_toughness = g_cfg.testStartToughness;
+        if (g_cfg.debugLog)
+        {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                "ToughnessFeast: test start toughness %.1f -> %.1f",
+                before, stats->_toughness);
+            DebugLog(msg);
+        }
     }
 }
 
@@ -366,6 +405,7 @@ static void (*medicalUpdate_orig)(MedicalSystem*, float) = nullptr;
 static void medicalUpdate_hook(MedicalSystem* self, float frameTime)
 {
     medicalUpdate_orig(self, frameTime);
+    ApplyTestStartToughness(self);
     ApplyFoodRegen(self, frameTime);
 }
 
@@ -455,5 +495,16 @@ extern "C" TF_EXPORT void startPlugin()
         ErrorLog("ToughnessFeast: failed to hook MedicalSystem::medicalUpdate");
     }
 
-    DebugLog("ToughnessFeast: ready — toughness past 100 trades combat soft-cap for food regen");
+    if (g_cfg.enableTestStart)
+    {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+            "ToughnessFeast: ready — TEST START ON (player toughness floor %.0f)",
+            g_cfg.testStartToughness);
+        DebugLog(msg);
+    }
+    else
+    {
+        DebugLog("ToughnessFeast: ready — toughness past 100 trades combat soft-cap for food regen");
+    }
 }

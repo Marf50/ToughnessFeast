@@ -64,6 +64,7 @@ class Character
 {
 public:
     bool amSomeoneWhoNeedsToEatToLive() { return true; }
+    bool isPlayerCharacter() const { return true; }
 };
 
 class CharStats
