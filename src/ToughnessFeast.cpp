@@ -63,6 +63,7 @@ struct Config
     int useRaceHeuristics;
     int enableHooks; // 0 = load-only (safe), 1 = install gameplay hooks
     int enableMedicalHooks; // 0 = skip medicalUpdate (world load safer)
+    int enableAnatomyPass; // 0 = only direct limb pointers (safer)
 };
 
 static Config g_cfg = {
@@ -73,7 +74,8 @@ static Config g_cfg = {
     1,  // debugLog
     1,  // useRaceHeuristics
     1,  // enableHooks
-    1   // enableMedicalHooks on — export resolve proven
+    1,  // enableMedicalHooks
+    0   // enableAnatomyPass default OFF (getPart was crash-risk)
 };
 
 static char g_pluginDir[MAX_PATH] = { 0 };
@@ -149,6 +151,7 @@ static void LoadConfig()
         char* val = TrimInPlace(eq + 1);
         if (std::strcmp(key, "EnableHooks") == 0) g_cfg.enableHooks = ParseBoolC(val);
         else if (std::strcmp(key, "EnableMedicalHooks") == 0) g_cfg.enableMedicalHooks = ParseBoolC(val);
+        else if (std::strcmp(key, "EnableAnatomyPass") == 0) g_cfg.enableAnatomyPass = ParseBoolC(val);
         else if (std::strcmp(key, "CombatCapToughness") == 0) g_cfg.combatCapToughness = (float)std::atof(val);
         else if (std::strcmp(key, "FoodRegenStartHuman") == 0 || std::strcmp(key, "FoodRegenStartOther") == 0
               || std::strcmp(key, "FoodRegenStartToughness") == 0)
@@ -173,32 +176,179 @@ static void LoadConfig()
 
 // ---------- gameplay (only used if EnableHooks=1) ----------
 
-static float FoodRegenStartFor(Character* me)
-{
-    if (!g_cfg.useRaceHeuristics) return g_cfg.foodRegenStart;
-    RaceData* race = me ? me->getRace() : nullptr;
-    if (!race) return g_cfg.foodRegenStart;
-    if (race->robot) return g_cfg.foodRegenStart;
-    if (race->gigantic) return g_cfg.foodRegenStartShek;
-    if (race->hungerRate > 1.15f && !race->gigantic) return g_cfg.foodRegenStartHiver;
-    return g_cfg.foodRegenStart;
-}
+// Ultra-safe regen: only touch POD fields on MedicalSystem / HealthPartStatus /
+// CharStats. No getRace, no setLimb, no isRobotic/maxHealth methods.
+// Those cross-DLL method calls were crashing on world load / in-game.
 
-static float FoodRegenScaleFor(Character* me)
+static float RegenPowerFromToughness(float toughness)
 {
-    if (!g_cfg.useRaceHeuristics) return g_cfg.foodRegenScalePerPoint;
-    RaceData* race = me ? me->getRace() : nullptr;
-    if (race && !race->robot && !race->gigantic && race->hungerRate > 1.15f)
-        return g_cfg.foodRegenScaleHiver;
-    return g_cfg.foodRegenScalePerPoint;
-}
-
-static float RegenPower(Character* me, float toughness)
-{
-    float excess = toughness - FoodRegenStartFor(me);
+    float excess = toughness - g_cfg.foodRegenStart;
     if (excess <= 0.f) return 0.f;
-    return excess * FoodRegenScaleFor(me);
+    float power = excess * g_cfg.foodRegenScalePerPoint;
+    if (power > 4.f) power = 4.f;
+    return power;
 }
+
+static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
+{
+    if (!med) return;
+    if (frameTime <= 0.f || frameTime > 2.f) return;
+
+    // POD flags on MedicalSystem
+    if (med->dead) return;
+
+    CharStats* stats = med->stats;
+    if (!stats) return;
+
+    float tough = stats->_toughness;
+    // Sanity: toughness is normally 0..200-ish; reject garbage
+    if (tough < 0.f || tough > 500.f) return;
+
+    float power = RegenPowerFromToughness(tough);
+    if (power <= 0.f) return;
+
+    // hunger is POD float 0..1
+    float hunger = med->hunger;
+    if (hunger < g_cfg.minHungerToRegen) return;
+    if (hunger > 10.f) return; // garbage guard
+
+    float fleshBudget = g_cfg.fleshHealPerSecond * power * frameTime;
+    float stunBudget = g_cfg.stunHealPerSecond * power * frameTime;
+    float limbBudget = g_cfg.limbRegrowPerSecond * power * frameTime;
+    float hungerCost = 0.f;
+    int anyHeal = 0;
+
+    // Prefer direct limb pointers (POD) for stump rebuild — no method calls
+    MedicalSystem::HealthPartStatus* limbs[4] = {
+        med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
+    };
+    for (int li = 0; li < 4; ++li)
+    {
+        MedicalSystem::HealthPartStatus* part = limbs[li];
+        if (!part) continue;
+
+        // Only POD fields. Treat very low flesh as "missing / ruined" candidate.
+        float maxHp = part->_maxHealth;
+        if (maxHp < 1.f || maxHp > 10000.f) continue;
+
+        float flesh = part->flesh;
+        // reject NaN/garbage
+        if (flesh != flesh) continue;
+        if (flesh > maxHp * 2.f) continue;
+
+        // Rebuild heavily damaged / missing-looking flesh on limbs
+        if (flesh < maxHp * 0.95f && limbBudget > 0.f)
+        {
+            // Focus budget on limbs that are badly hurt (stump-like)
+            float severity = 1.f;
+            if (flesh < 0.f)
+            {
+                if (!g_cfg.healUnhealable) continue;
+                severity = 0.5f;
+                flesh = 0.f; // start climbing from 0
+            }
+            else if (flesh > maxHp * 0.25f)
+            {
+                // mostly healthy limb — leave for general pass
+                continue;
+            }
+
+            float need = maxHp - flesh;
+            float take = need;
+            if (take > limbBudget * severity) take = limbBudget * severity;
+            if (take < 0.f) continue;
+            part->flesh = flesh + take;
+            limbBudget -= take;
+            hungerCost += take * 0.5f;
+            anyHeal = 1;
+
+            // Soft stun clear
+            if (part->fleshStun > 0.f && stunBudget > 0.f)
+            {
+                float st = part->fleshStun;
+                if (st > stunBudget) st = stunBudget;
+                part->fleshStun -= st;
+                stunBudget -= st;
+            }
+        }
+    }
+
+    // Optional anatomy pass (getPart). Off by default — method iteration crashed for some.
+    if (g_cfg.enableAnatomyPass)
+    {
+        int count = 0;
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+        count = med->getPartCount();
+#endif
+        if (count < 0) count = 0;
+        if (count > 32) count = 32;
+
+        for (int i = 0; i < count; ++i)
+        {
+            MedicalSystem::HealthPartStatus* part = nullptr;
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+            part = med->getPart((unsigned long long)i);
+#endif
+            if (!part) continue;
+
+            float maxHp = part->_maxHealth;
+            if (maxHp < 1.f || maxHp > 10000.f) continue;
+            float flesh = part->flesh;
+            if (flesh != flesh) continue;
+            if (flesh > maxHp * 2.f) continue;
+
+            if (part->fleshStun > 0.f && stunBudget > 0.f)
+            {
+                float st = part->fleshStun;
+                if (st != st || st > 1e6f) continue;
+                if (st > stunBudget) st = stunBudget;
+                part->fleshStun -= st;
+                stunBudget -= st;
+                hungerCost += st * 0.1f;
+                anyHeal = 1;
+            }
+
+            if (flesh < maxHp && fleshBudget > 0.f)
+            {
+                int isOver = (flesh < 0.f) ? 1 : 0;
+                if (isOver && !g_cfg.healUnhealable) continue;
+                float rate = isOver ? 0.4f : 1.f;
+                float need = isOver ? (-flesh) : (maxHp - flesh);
+                float room = fleshBudget * rate;
+                float take = need;
+                if (take > room) take = room;
+                if (take <= 0.f) continue;
+                part->flesh = flesh + take;
+                fleshBudget -= take / (rate > 0.01f ? rate : 1.f);
+                hungerCost += take * (isOver ? 0.5f : 0.2f);
+                anyHeal = 1;
+            }
+        }
+    }
+
+    if (anyHeal && hungerCost > 0.f)
+    {
+        float drain = g_cfg.hungerDrainPerSecond * power * frameTime;
+        drain += hungerCost * 0.001f;
+        float next = hunger - drain;
+        if (next < 0.f) next = 0.f;
+        if (next > 10.f) next = hunger; // don't write garbage
+        med->hunger = next;
+
+        if (g_cfg.debugLog)
+        {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                "ToughnessFeast: regen t=%.1f p=%.2f h=%.3f", tough, power, next);
+            DebugLog(msg);
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Soft-cap combat toughness at combatCapToughness (default 100)
+// ---------------------------------------------------------------------------
 
 static float (*calculateToughnessDamageResistanceMult_orig)(CharStats*) = nullptr;
 static float calculateToughnessDamageResistanceMult_hook(CharStats* self)
@@ -225,6 +375,10 @@ static float calculateToughnessWoundDegenerationRate_hook(CharStats* self)
     self->_toughness = saved;
     return r;
 }
+
+// ---------------------------------------------------------------------------
+// XP past 100
+// ---------------------------------------------------------------------------
 
 static void (*xpStat_eventBased_orig)(CharStats*, StatsEnumerated, float) = nullptr;
 static void xpStat_eventBased_hook(CharStats* self, StatsEnumerated st, float amount)
@@ -266,140 +420,14 @@ static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
     }
 }
 
-static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
-{
-    if (!med || frameTime <= 0.f || med->dead) return;
-    CharStats* stats = med->stats;
-    Character* me = med->me;
-    if (!stats || !me) return;
-    if (!me->amSomeoneWhoNeedsToEatToLive()) return;
-
-    float tough = stats->_toughness;
-    float power = RegenPower(me, tough);
-    if (power <= 0.f) return;
-    if (power > 4.f) power = 4.f;
-    if (med->hunger < g_cfg.minHungerToRegen) return;
-
-    float fleshBudget = g_cfg.fleshHealPerSecond * power * frameTime;
-    float stunBudget = g_cfg.stunHealPerSecond * power * frameTime;
-    float limbBudget = g_cfg.limbRegrowPerSecond * power * frameTime;
-    float hungerCost = 0.f;
-    int anyHeal = 0;
-
-    if (limbBudget > 0.f && g_cfg.limbRegrowPerSecond > 0.f)
-    {
-        MedicalSystem::HealthPartStatus* limbs[4] = {
-            med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
-        };
-        for (int li = 0; li < 4; ++li)
-        {
-            MedicalSystem::HealthPartStatus* part = limbs[li];
-            if (!part || part->isRobotic()) continue;
-            LimbState ls = part->getRobotLimbState();
-            if (ls == LIMB_REPLACED) continue;
-            int missing = (ls == LIMB_STUMP || ls == LIMB_CRUSHED) ? 1 : 0;
-            float maxHp = part->maxHealth();
-            if (maxHp <= 1.f) maxHp = part->_maxHealth;
-            if (maxHp <= 1.f) maxHp = 100.f;
-            if (!missing && part->flesh > maxHp * 0.05f) continue;
-
-            if (part->flesh < maxHp && limbBudget > 0.f)
-            {
-                if (part->flesh < 0.f) part->flesh = 0.f;
-                float need = maxHp - part->flesh;
-                float take = (need < limbBudget) ? need : limbBudget;
-                if (ls == LIMB_CRUSHED) take *= 0.75f;
-                part->flesh += take;
-                limbBudget -= take;
-                hungerCost += take * 0.8f;
-                anyHeal = 1;
-            }
-
-            float restoreAt = maxHp * g_cfg.limbRestoreFleshPct;
-            if (restoreAt < 1.f) restoreAt = maxHp * 0.85f;
-            if (missing && part->flesh >= restoreAt && med->robotLimbs)
-            {
-                RobotLimbs::Limb limbEnum = part->getRobotLimbEnum();
-                if (limbEnum != RobotLimbs::NULL_LIMB)
-                {
-                    med->robotLimbs->setLimb(limbEnum, LIMB_ORIGINAL, nullptr);
-                    if (part->flesh < maxHp * 0.9f) part->flesh = maxHp * 0.9f;
-                    part->fleshStun = 0.f;
-                    part->updateDerivedHealths();
-                    anyHeal = 1;
-                    DebugLog("ToughnessFeast: restored limb");
-                }
-            }
-            else
-                part->updateDerivedHealths();
-        }
-    }
-
-    int count = med->getPartCount();
-    for (int pass = 0; pass < 2; ++pass)
-    {
-        for (int i = 0; i < count; ++i)
-        {
-            MedicalSystem::HealthPartStatus* part = med->getPart((unsigned long long)i);
-            if (!part || part->isRobotic()) continue;
-            LimbState ls = part->getRobotLimbState();
-            int missing = (ls == LIMB_STUMP || ls == LIMB_CRUSHED) ? 1 : 0;
-            if (part->isDead() && !missing) continue;
-            if (missing) continue;
-            float maxHp = part->maxHealth();
-            if (maxHp <= 0.f) continue;
-            int isOver = (part->flesh < 0.f) ? 1 : 0;
-            if (pass == 0 && !isOver) continue;
-            if (pass == 1 && isOver) continue;
-            if (isOver && !g_cfg.healUnhealable) continue;
-
-            if (part->fleshStun > 0.f && stunBudget > 0.f)
-            {
-                float take = (part->fleshStun < stunBudget) ? part->fleshStun : stunBudget;
-                part->fleshStun -= take;
-                stunBudget -= take;
-                hungerCost += take * 0.15f;
-                anyHeal = 1;
-            }
-            if (part->flesh < maxHp && fleshBudget > 0.f)
-            {
-                float need = maxHp - part->flesh;
-                float rate = isOver ? 0.45f : 1.f;
-                float room = fleshBudget * rate;
-                float take = (need < room) ? need : room;
-                part->flesh += take;
-                fleshBudget -= take / rate;
-                hungerCost += take * (isOver ? 0.55f : 0.25f);
-                anyHeal = 1;
-            }
-            part->updateDerivedHealths();
-        }
-    }
-
-    if (anyHeal && hungerCost > 0.f)
-    {
-        float drain = g_cfg.hungerDrainPerSecond * power * frameTime;
-        drain += hungerCost * 0.0015f;
-        float next = med->hunger - drain;
-        med->hunger = (next > 0.f) ? next : 0.f;
-        if (g_cfg.debugLog)
-        {
-            char msg[128];
-            std::snprintf(msg, sizeof(msg), "ToughnessFeast: regen t=%.1f p=%.2f", tough, power);
-            DebugLog(msg);
-        }
-    }
-}
-
 static void (*medicalUpdate_orig)(MedicalSystem*, float) = nullptr;
 static void medicalUpdate_hook(MedicalSystem* self, float frameTime)
 {
-    // Always run vanilla first; never skip it
     if (medicalUpdate_orig)
         medicalUpdate_orig(self, frameTime);
-    // Regen is best-effort — never let exceptions escape into the game
-    if (self && frameTime > 0.f && frameTime < 5.f)
-        ApplyFoodRegen(self, frameTime);
+    if (!self) return;
+    if (frameTime <= 0.f || frameTime > 1.5f) return;
+    ApplyFoodRegen(self, frameTime);
 }
 
 // ---------------------------------------------------------------------------
@@ -542,5 +570,5 @@ TF_EXPORT void startPlugin()
     }
 
     InstallHooks();
-    DebugLog("ToughnessFeast: ready (hooks on)");
+    DebugLog("ToughnessFeast: ready (hooks on, POD-safe regen)");
 }
