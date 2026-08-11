@@ -62,6 +62,7 @@ struct Config
     int debugLog;
     int useRaceHeuristics;
     int enableHooks; // 0 = load-only (safe), 1 = install gameplay hooks
+    int enableMedicalHooks; // 0 = skip medicalUpdate (world load safer)
 };
 
 static Config g_cfg = {
@@ -69,8 +70,10 @@ static Config g_cfg = {
     0.04f, 0.012f,
     2.5f, 1.5f, 0.012f, 0.10f,
     1, 3.0f, 0.85f, 0.18f,
-    1, 1,
-    1  // EnableHooks default ON (load path verified)
+    1,  // debugLog
+    1,  // useRaceHeuristics
+    1,  // enableHooks
+    0   // enableMedicalHooks default off until world load OK
 };
 
 static char g_pluginDir[MAX_PATH] = { 0 };
@@ -145,6 +148,7 @@ static void LoadConfig()
         char* key = TrimInPlace(s);
         char* val = TrimInPlace(eq + 1);
         if (std::strcmp(key, "EnableHooks") == 0) g_cfg.enableHooks = ParseBoolC(val);
+        else if (std::strcmp(key, "EnableMedicalHooks") == 0) g_cfg.enableMedicalHooks = ParseBoolC(val);
         else if (std::strcmp(key, "CombatCapToughness") == 0) g_cfg.combatCapToughness = (float)std::atof(val);
         else if (std::strcmp(key, "FoodRegenStartHuman") == 0 || std::strcmp(key, "FoodRegenStartOther") == 0
               || std::strcmp(key, "FoodRegenStartToughness") == 0)
@@ -493,21 +497,16 @@ static void InstallHooks()
                "ToughnessFeast: hooked wound degen");
 
     // XP past 100
-    if (g_cfg.enableXpHooks)
-    {
-        HookExport("?xpStat_eventBased@CharStats@@QEAAXW4StatsEnumerated@@M@Z",
-                   (void*)xpStat_eventBased_hook,
-                   (void**)&xpStat_eventBased_orig,
-                   "ToughnessFeast: hooked xp event");
-        HookExport("?xpStat_timeBased@CharStats@@QEAAXW4StatsEnumerated@@@Z",
-                   (void*)xpStat_timeBased_hook,
-                   (void**)&xpStat_timeBased_orig,
-                   "ToughnessFeast: hooked xp time");
-    }
-    else
-        DebugLog("ToughnessFeast: XP hooks skipped (EnableXpHooks=0)");
+    HookExport("?xpStat_eventBased@CharStats@@QEAAXW4StatsEnumerated@@M@Z",
+               (void*)xpStat_eventBased_hook,
+               (void**)&xpStat_eventBased_orig,
+               "ToughnessFeast: hooked xp event");
+    HookExport("?xpStat_timeBased@CharStats@@QEAAXW4StatsEnumerated@@@Z",
+               (void*)xpStat_timeBased_hook,
+               (void**)&xpStat_timeBased_orig,
+               "ToughnessFeast: hooked xp time");
 
-    // Food / limb regen — most likely to crash on world load if wrong
+    // Food / limb regen
     if (g_cfg.enableMedicalHooks)
     {
         HookExport("?medicalUpdate@MedicalSystem@@QEAAXM@Z",
