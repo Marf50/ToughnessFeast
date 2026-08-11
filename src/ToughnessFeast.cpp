@@ -1,10 +1,8 @@
 // ToughnessFeast — RE_Kenshi plugin
+// Export: C++ mangled ?startPlugin@@YAXXZ (NOT extern "C")
 //
-// Build notes:
-// - Export MUST be C++ mangled: ?startPlugin@@YAXXZ  (no extern "C")
-// - Avoid reading game std::string members (VS2010 vs modern ABI crash)
-// - Avoid <fstream>/<iostream> (static CRT init can crash under mixed runtime)
-// - Only call game methods that return POD / raw pointers
+// SAFETY: EnableHooks=0 by default. startPlugin only logs.
+// Set EnableHooks=1 in config.ini after the game opens cleanly.
 
 #if defined(TOUGHNESSFEAST_LINUX_IDE)
 #include "kenshi_ide_stubs.h"
@@ -14,16 +12,13 @@
 #define NOMINMAX
 #endif
 #include <Windows.h>
-
 #include <Debug.h>
 #include <core/Functions.h>
-
 #include <kenshi/CharStats.h>
 #include <kenshi/Character.h>
 #include <kenshi/MedicalSystem.h>
 #include <kenshi/Enums.h>
 #include <kenshi/RaceData.h>
-// Intentionally NO GameData / StringPair / DatapanelGUI / fstream
 #endif
 
 #include <cstdio>
@@ -47,51 +42,34 @@ static int tf_strncpy_s(char* dest, size_t destsz, const char* src, size_t)
 #define strncpy_s tf_strncpy_s
 #endif
 
-// ---------------------------------------------------------------------------
-// Config (POD only)
-// ---------------------------------------------------------------------------
-
 struct Config
 {
     float combatCapToughness;
-    float foodRegenStart;       // single threshold (no race string reads)
-    float foodRegenStartHiver;  // used if RaceData::robot==false and we use heuristic later
+    float foodRegenStart;
+    float foodRegenStartShek;
+    float foodRegenStartHiver;
     float foodRegenScalePerPoint;
     float foodRegenScaleHiver;
     float fleshHealPerSecond;
     float stunHealPerSecond;
     float hungerDrainPerSecond;
     float minHungerToRegen;
-    int   healUnhealable;
+    int healUnhealable;
     float limbRegrowPerSecond;
     float limbRestoreFleshPct;
     float past100XpMult;
-    int   debugLog;
-    // Optional race thresholds without reading names:
-    //   if RaceData::robot -> no food regen (skeletons handled via amSomeoneWhoNeedsToEatToLive)
-    //   if RaceData::gigantic -> treat as shek-ish (shek are large) — weak heuristic
-    //   else use foodRegenStart
-    float foodRegenStartShek;
-    int   useRaceHeuristics;
+    int debugLog;
+    int useRaceHeuristics;
+    int enableHooks; // 0 = load-only (safe), 1 = install gameplay hooks
 };
 
 static Config g_cfg = {
-    100.f,   // combatCap
-    75.f,    // foodRegenStart (human/default)
-    0.f,     // foodRegenStartHiver (unused if heuristics off for hiver names)
-    0.04f,   // scale
-    0.012f,  // hiver scale
-    2.5f,    // flesh/s
-    1.5f,    // stun/s
-    0.012f,  // hunger drain
-    0.10f,   // min hunger
-    1,       // heal unhealable
-    3.0f,    // limb regrow/s
-    0.85f,   // restore pct
-    0.18f,   // past100 xp
-    1,       // debugLog ON while testing
-    50.f,    // shek start
-    1        // useRaceHeuristics
+    100.f, 75.f, 50.f, 0.f,
+    0.04f, 0.012f,
+    2.5f, 1.5f, 0.012f, 0.10f,
+    1, 3.0f, 0.85f, 0.18f,
+    1, 1,
+    0  // EnableHooks DEFAULT OFF until proven stable
 };
 
 static char g_pluginDir[MAX_PATH] = { 0 };
@@ -107,12 +85,37 @@ static char* TrimInPlace(char* s)
 
 static int ParseBoolC(const char* v)
 {
-    return (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y') ? 1 : 0;
+    return (v && (v[0]=='1'||v[0]=='t'||v[0]=='T'||v[0]=='y'||v[0]=='Y')) ? 1 : 0;
+}
+
+static void ResolvePluginDir()
+{
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    HMODULE hm = nullptr;
+    if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&ResolvePluginDir, &hm))
+    {
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(hm, path, MAX_PATH);
+        if (n > 0 && n < MAX_PATH)
+        {
+            for (int i = (int)n - 1; i >= 0; --i)
+            {
+                if (path[i] == '\\' || path[i] == '/') { path[i] = 0; break; }
+            }
+            strncpy_s(g_pluginDir, path, _TRUNCATE);
+        }
+    }
+#else
+    (void)g_pluginDir;
+#endif
 }
 
 static void LoadConfig()
 {
     char path[MAX_PATH + 32];
+    path[0] = 0;
     if (g_pluginDir[0])
         std::snprintf(path, sizeof(path), "%s\\config.ini", g_pluginDir);
     else
@@ -126,7 +129,7 @@ static void LoadConfig()
     }
     if (!f)
     {
-        DebugLog("ToughnessFeast: no config.ini, defaults");
+        DebugLog("ToughnessFeast: no config.ini (hooks stay OFF)");
         return;
     }
 
@@ -140,9 +143,10 @@ static void LoadConfig()
         *eq = 0;
         char* key = TrimInPlace(s);
         char* val = TrimInPlace(eq + 1);
-        if (std::strcmp(key, "CombatCapToughness") == 0) g_cfg.combatCapToughness = (float)std::atof(val);
-        else if (std::strcmp(key, "FoodRegenStartToughness") == 0 || std::strcmp(key, "FoodRegenStartHuman") == 0
-              || std::strcmp(key, "FoodRegenStartOther") == 0)
+        if (std::strcmp(key, "EnableHooks") == 0) g_cfg.enableHooks = ParseBoolC(val);
+        else if (std::strcmp(key, "CombatCapToughness") == 0) g_cfg.combatCapToughness = (float)std::atof(val);
+        else if (std::strcmp(key, "FoodRegenStartHuman") == 0 || std::strcmp(key, "FoodRegenStartOther") == 0
+              || std::strcmp(key, "FoodRegenStartToughness") == 0)
             g_cfg.foodRegenStart = (float)std::atof(val);
         else if (std::strcmp(key, "FoodRegenStartShek") == 0) g_cfg.foodRegenStartShek = (float)std::atof(val);
         else if (std::strcmp(key, "FoodRegenStartHiver") == 0) g_cfg.foodRegenStartHiver = (float)std::atof(val);
@@ -160,57 +164,24 @@ static void LoadConfig()
         else if (std::strcmp(key, "UseRaceHeuristics") == 0) g_cfg.useRaceHeuristics = ParseBoolC(val);
     }
     std::fclose(f);
-
-    char msg[192];
-    std::snprintf(msg, sizeof(msg),
-        "ToughnessFeast: cfg start=%.0f shek=%.0f hiver=%.0f limb=%.1f",
-        g_cfg.foodRegenStart, g_cfg.foodRegenStartShek,
-        g_cfg.foodRegenStartHiver, g_cfg.limbRegrowPerSecond);
-    DebugLog(msg);
 }
 
-// ---------------------------------------------------------------------------
-// Race heuristics WITHOUT reading std::string names (ABI-safe)
-// ---------------------------------------------------------------------------
+// ---------- gameplay (only used if EnableHooks=1) ----------
 
-// Hivers aren't flagged in POD alone reliably. We use:
-//   - skeletons: amSomeoneWhoNeedsToEatToLive() == false
-//   - RaceData::gigantic ~ shek / giants → shek threshold
-//   - else default human threshold
-// Config UseRaceHeuristics=0 forces single FoodRegenStartHuman for everyone.
-// Hiver early unlock: set FoodRegenStartHiver and we'll also check healRate /
-// hungerRate POD fields which differ by race in vanilla data.
 static float FoodRegenStartFor(Character* me)
 {
-    if (!g_cfg.useRaceHeuristics)
-        return g_cfg.foodRegenStart;
-
+    if (!g_cfg.useRaceHeuristics) return g_cfg.foodRegenStart;
     RaceData* race = me ? me->getRace() : nullptr;
-    if (!race)
-        return g_cfg.foodRegenStart;
-
-    // Skeletons / robots: caller already skips non-eaters; keep default
-    if (race->robot)
-        return g_cfg.foodRegenStart;
-
-    // Shek / large races
-    if (race->gigantic)
-        return g_cfg.foodRegenStartShek;
-
-    // Hiver-ish: vanilla hivers have higher hungerRate than greenlanders.
-    // Greenlander hungerRate ~1.0, hiver worker/soldier often higher; shek similar to human.
-    // Use healRate as secondary signal (hivers heal differently).
-    // These are floats baked into RaceData — POD, safe.
-    if (race->hungerRate > 1.15f && race->healRate > 0.f && !race->gigantic)
-        return g_cfg.foodRegenStartHiver;
-
+    if (!race) return g_cfg.foodRegenStart;
+    if (race->robot) return g_cfg.foodRegenStart;
+    if (race->gigantic) return g_cfg.foodRegenStartShek;
+    if (race->hungerRate > 1.15f && !race->gigantic) return g_cfg.foodRegenStartHiver;
     return g_cfg.foodRegenStart;
 }
 
 static float FoodRegenScaleFor(Character* me)
 {
-    if (!g_cfg.useRaceHeuristics)
-        return g_cfg.foodRegenScalePerPoint;
+    if (!g_cfg.useRaceHeuristics) return g_cfg.foodRegenScalePerPoint;
     RaceData* race = me ? me->getRace() : nullptr;
     if (race && !race->robot && !race->gigantic && race->hungerRate > 1.15f)
         return g_cfg.foodRegenScaleHiver;
@@ -224,48 +195,36 @@ static float RegenPower(Character* me, float toughness)
     return excess * FoodRegenScaleFor(me);
 }
 
-// ---------------------------------------------------------------------------
-// Soft-cap combat toughness
-// ---------------------------------------------------------------------------
-
-struct ToughnessClamp
-{
-    CharStats* stats;
-    float saved;
-    int active;
-    ToughnessClamp(CharStats* s, float cap) : stats(s), saved(0.f), active(0)
-    {
-        if (!s) return;
-        saved = s->_toughness;
-        if (saved > cap) { s->_toughness = cap; active = 1; }
-    }
-    ~ToughnessClamp()
-    {
-        if (active && stats) stats->_toughness = saved;
-    }
-};
-
 static float (*calculateToughnessDamageResistanceMult_orig)(CharStats*) = nullptr;
 static float calculateToughnessDamageResistanceMult_hook(CharStats* self)
 {
-    ToughnessClamp clamp(self, g_cfg.combatCapToughness);
-    return calculateToughnessDamageResistanceMult_orig(self);
+    if (!self || !calculateToughnessDamageResistanceMult_orig)
+        return 1.f;
+    float saved = self->_toughness;
+    if (saved > g_cfg.combatCapToughness)
+        self->_toughness = g_cfg.combatCapToughness;
+    float r = calculateToughnessDamageResistanceMult_orig(self);
+    self->_toughness = saved;
+    return r;
 }
 
 static float (*calculateToughnessWoundDegenerationRate_orig)(CharStats*) = nullptr;
 static float calculateToughnessWoundDegenerationRate_hook(CharStats* self)
 {
-    ToughnessClamp clamp(self, g_cfg.combatCapToughness);
-    return calculateToughnessWoundDegenerationRate_orig(self);
+    if (!self || !calculateToughnessWoundDegenerationRate_orig)
+        return 1.f;
+    float saved = self->_toughness;
+    if (saved > g_cfg.combatCapToughness)
+        self->_toughness = g_cfg.combatCapToughness;
+    float r = calculateToughnessWoundDegenerationRate_orig(self);
+    self->_toughness = saved;
+    return r;
 }
-
-// ---------------------------------------------------------------------------
-// XP past 100
-// ---------------------------------------------------------------------------
 
 static void (*xpStat_eventBased_orig)(CharStats*, StatsEnumerated, float) = nullptr;
 static void xpStat_eventBased_hook(CharStats* self, StatsEnumerated st, float amount)
 {
+    if (!xpStat_eventBased_orig) return;
     if (!self || st != STAT_TOUGHNESS)
     {
         xpStat_eventBased_orig(self, st, amount);
@@ -286,6 +245,7 @@ static void xpStat_eventBased_hook(CharStats* self, StatsEnumerated st, float am
 static void (*xpStat_timeBased_orig)(CharStats*, StatsEnumerated) = nullptr;
 static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
 {
+    if (!xpStat_timeBased_orig) return;
     if (!self || st != STAT_TOUGHNESS)
     {
         xpStat_timeBased_orig(self, st);
@@ -300,10 +260,6 @@ static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
         self->_toughness = before + 0.002f * mult;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Food regen + limb regrow
-// ---------------------------------------------------------------------------
 
 static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
 {
@@ -325,7 +281,6 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
     float hungerCost = 0.f;
     int anyHeal = 0;
 
-    // Stumps / crushed — do not skip isDead limbs
     if (limbBudget > 0.f && g_cfg.limbRegrowPerSecond > 0.f)
     {
         MedicalSystem::HealthPartStatus* limbs[4] = {
@@ -334,19 +289,14 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
         for (int li = 0; li < 4; ++li)
         {
             MedicalSystem::HealthPartStatus* part = limbs[li];
-            if (!part) continue;
-            if (part->isRobotic()) continue;
-
+            if (!part || part->isRobotic()) continue;
             LimbState ls = part->getRobotLimbState();
             if (ls == LIMB_REPLACED) continue;
-
             int missing = (ls == LIMB_STUMP || ls == LIMB_CRUSHED) ? 1 : 0;
             float maxHp = part->maxHealth();
             if (maxHp <= 1.f) maxHp = part->_maxHealth;
             if (maxHp <= 1.f) maxHp = 100.f;
-
-            if (!missing && part->flesh > maxHp * 0.05f)
-                continue;
+            if (!missing && part->flesh > maxHp * 0.05f) continue;
 
             if (part->flesh < maxHp && limbBudget > 0.f)
             {
@@ -362,7 +312,6 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
 
             float restoreAt = maxHp * g_cfg.limbRestoreFleshPct;
             if (restoreAt < 1.f) restoreAt = maxHp * 0.85f;
-
             if (missing && part->flesh >= restoreAt && med->robotLimbs)
             {
                 RobotLimbs::Limb limbEnum = part->getRobotLimbEnum();
@@ -377,9 +326,7 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
                 }
             }
             else
-            {
                 part->updateDerivedHealths();
-            }
         }
     }
 
@@ -390,15 +337,12 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
         {
             MedicalSystem::HealthPartStatus* part = med->getPart((unsigned long long)i);
             if (!part || part->isRobotic()) continue;
-
             LimbState ls = part->getRobotLimbState();
             int missing = (ls == LIMB_STUMP || ls == LIMB_CRUSHED) ? 1 : 0;
             if (part->isDead() && !missing) continue;
             if (missing) continue;
-
             float maxHp = part->maxHealth();
             if (maxHp <= 0.f) continue;
-
             int isOver = (part->flesh < 0.f) ? 1 : 0;
             if (pass == 0 && !isOver) continue;
             if (pass == 1 && isOver) continue;
@@ -435,9 +379,8 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
         med->hunger = (next > 0.f) ? next : 0.f;
         if (g_cfg.debugLog)
         {
-            char msg[160];
-            std::snprintf(msg, sizeof(msg),
-                "ToughnessFeast: regen t=%.1f p=%.2f h=%.3f", tough, power, med->hunger);
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "ToughnessFeast: regen t=%.1f p=%.2f", tough, power);
             DebugLog(msg);
         }
     }
@@ -451,100 +394,69 @@ static void medicalUpdate_hook(MedicalSystem* self, float frameTime)
     ApplyFoodRegen(self, frameTime);
 }
 
-// ---------------------------------------------------------------------------
-// Safe hook install (SEH on MSVC so one bad address doesn't kill Kenshi)
-// ---------------------------------------------------------------------------
-
-static void ResolvePluginDir()
-{
-#if defined(TOUGHNESSFEAST_LINUX_IDE)
-    (void)g_pluginDir;
-#else
-    HMODULE hm = nullptr;
-    if (GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            (LPCSTR)&ResolvePluginDir, &hm))
-    {
-        char path[MAX_PATH];
-        DWORD n = GetModuleFileNameA(hm, path, MAX_PATH);
-        if (n > 0 && n < MAX_PATH)
-        {
-            for (int i = (int)n - 1; i >= 0; --i)
-            {
-                if (path[i] == '\\' || path[i] == '/') { path[i] = 0; break; }
-            }
-            strncpy_s(g_pluginDir, path, _TRUNCATE);
-        }
-    }
-#endif
-}
-
-static int TryAddHook(void* target, void* detour, void** original, const char* name)
+static int TryAddHook(void* target, void* detour, void** original, const char* okMsg)
 {
     if (!target)
     {
-        ErrorLog(name);
-        ErrorLog("ToughnessFeast: GetRealAddress returned null");
+        ErrorLog("ToughnessFeast: null GetRealAddress");
+        ErrorLog(okMsg);
         return 0;
     }
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(target, detour, original))
     {
-        ErrorLog(name);
         ErrorLog("ToughnessFeast: AddHook failed");
+        ErrorLog(okMsg);
         return 0;
     }
-    DebugLog(name);
+    DebugLog(okMsg);
     return 1;
 }
 
-// RE_Kenshi: GetProcAddress(plugin, "?startPlugin@@YAXXZ") — C++ linkage required
+static void InstallHooks()
+{
+    DebugLog("ToughnessFeast: EnableHooks=1, installing...");
+    TryAddHook((void*)KenshiLib::GetRealAddress(&CharStats::calculateToughnessDamageResistanceMult),
+               (void*)calculateToughnessDamageResistanceMult_hook,
+               (void**)&calculateToughnessDamageResistanceMult_orig,
+               "ToughnessFeast: hooked DR");
+    TryAddHook((void*)KenshiLib::GetRealAddress(&CharStats::calculateToughnessWoundDegenerationRate),
+               (void*)calculateToughnessWoundDegenerationRate_hook,
+               (void**)&calculateToughnessWoundDegenerationRate_orig,
+               "ToughnessFeast: hooked wound degen");
+    TryAddHook((void*)KenshiLib::GetRealAddress(&CharStats::xpStat_eventBased),
+               (void*)xpStat_eventBased_hook,
+               (void**)&xpStat_eventBased_orig,
+               "ToughnessFeast: hooked xp event");
+    TryAddHook((void*)KenshiLib::GetRealAddress(&CharStats::xpStat_timeBased),
+               (void*)xpStat_timeBased_hook,
+               (void**)&xpStat_timeBased_orig,
+               "ToughnessFeast: hooked xp time");
+    TryAddHook((void*)KenshiLib::GetRealAddress(&MedicalSystem::medicalUpdate),
+               (void*)medicalUpdate_hook,
+               (void**)&medicalUpdate_orig,
+               "ToughnessFeast: hooked medicalUpdate");
+}
+
 #if defined(_MSC_VER)
 #define TF_EXPORT __declspec(dllexport)
 #else
 #define TF_EXPORT __attribute__((visibility("default")))
 #endif
 
+// RE_Kenshi: GetProcAddress(..., "?startPlugin@@YAXXZ")
 TF_EXPORT void startPlugin()
 {
     DebugLog("ToughnessFeast: startPlugin entered");
     ResolvePluginDir();
     LoadConfig();
-    DebugLog("ToughnessFeast: installing hooks...");
 
-    // Core combat soft-cap
-    TryAddHook(
-        (void*)KenshiLib::GetRealAddress(&CharStats::calculateToughnessDamageResistanceMult),
-        (void*)calculateToughnessDamageResistanceMult_hook,
-        (void**)&calculateToughnessDamageResistanceMult_orig,
-        "ToughnessFeast: hooked DR");
+    if (!g_cfg.enableHooks)
+    {
+        DebugLog("ToughnessFeast: SAFE MODE (EnableHooks=0) — loaded, no hooks");
+        DebugLog("ToughnessFeast: set EnableHooks=1 in config.ini after game opens OK");
+        return;
+    }
 
-    TryAddHook(
-        (void*)KenshiLib::GetRealAddress(&CharStats::calculateToughnessWoundDegenerationRate),
-        (void*)calculateToughnessWoundDegenerationRate_hook,
-        (void**)&calculateToughnessWoundDegenerationRate_orig,
-        "ToughnessFeast: hooked wound degen");
-
-    // XP past 100
-    TryAddHook(
-        (void*)KenshiLib::GetRealAddress(&CharStats::xpStat_eventBased),
-        (void*)xpStat_eventBased_hook,
-        (void**)&xpStat_eventBased_orig,
-        "ToughnessFeast: hooked xp event");
-
-    TryAddHook(
-        (void*)KenshiLib::GetRealAddress(&CharStats::xpStat_timeBased),
-        (void*)xpStat_timeBased_hook,
-        (void**)&xpStat_timeBased_orig,
-        "ToughnessFeast: hooked xp time");
-
-    // Food regen / limbs — this is the critical gameplay hook
-    TryAddHook(
-        (void*)KenshiLib::GetRealAddress(&MedicalSystem::medicalUpdate),
-        (void*)medicalUpdate_hook,
-        (void**)&medicalUpdate_orig,
-        "ToughnessFeast: hooked medicalUpdate");
-
-    // NO GUI hooks — they pass std::string across the VS2010/modern ABI boundary.
-
-    DebugLog("ToughnessFeast: ready");
+    InstallHooks();
+    DebugLog("ToughnessFeast: ready (hooks on)");
 }

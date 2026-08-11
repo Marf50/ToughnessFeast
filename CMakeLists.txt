@@ -82,8 +82,8 @@ if(_GAME_BUILD)
   )
 
   if(MSVC)
-    set_property(TARGET ToughnessFeast PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
-    target_compile_options(ToughnessFeast PRIVATE /W3 /EHs-c- /D_HAS_EXCEPTIONS=0 /GR- /bigobj /GS-)
+    set_property(TARGET ToughnessFeast PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+    target_compile_options(ToughnessFeast PRIVATE /W3 /EHsc /bigobj)
   endif()
 
   # Link KenshiLib (filename case varies)
