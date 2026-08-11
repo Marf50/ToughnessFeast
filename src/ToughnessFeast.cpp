@@ -538,6 +538,17 @@ struct LimbInfo
     float severity;  // 0..1 combat impact
 };
 
+// RobotLimbs* lives at MedicalSystem+0xC8 in the game binary.
+// Do not use med->robotLimbs field access (map layout drift).
+static RobotLimbs* GetRobotLimbs(MedicalSystem* med)
+{
+    if (!med) return nullptr;
+    RobotLimbs* r = nullptr;
+    std::memcpy(&r, (const char*)(void*)med + 0xC8, sizeof(r));
+    if (r && (uintptr_t)r > 0x10000ull) return r;
+    return nullptr;
+}
+
 static MedicalSystem::HealthPartStatus* ResolveLimb(MedicalSystem* med, int slot)
 {
     if (!med) return nullptr;
@@ -545,22 +556,75 @@ static MedicalSystem::HealthPartStatus* ResolveLimb(MedicalSystem* med, int slot
         RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
         RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
     };
-    MedicalSystem::HealthPartStatus* p = med->getPart(kEnum[slot]);
-    if (p) return p;
+
+    // Method calls use game code — layout-safe
+    MedicalSystem::HealthPartStatus* p = nullptr;
+    TF_SEH_TRY { p = med->getPart(kEnum[slot]); }
+    TF_SEH_EXCEPT { p = nullptr; }
+    if (p && (uintptr_t)p > 0x10000ull) return p;
 
     using PT = MedicalSystem::HealthPartStatus::PartType;
-    if (slot == 0) p = med->getPart(PT::PART_ARM, SIDE_LEFT);
-    else if (slot == 1) p = med->getPart(PT::PART_ARM, SIDE_RIGHT);
-    else if (slot == 2) p = med->getPart(PT::PART_LEG, SIDE_LEFT);
-    else if (slot == 3) p = med->getPart(PT::PART_LEG, SIDE_RIGHT);
-    if (p) return p;
+    TF_SEH_TRY
+    {
+        if (slot == 0) p = med->getPart(PT::PART_ARM, SIDE_LEFT);
+        else if (slot == 1) p = med->getPart(PT::PART_ARM, SIDE_RIGHT);
+        else if (slot == 2) p = med->getPart(PT::PART_LEG, SIDE_LEFT);
+        else if (slot == 3) p = med->getPart(PT::PART_LEG, SIDE_RIGHT);
+    }
+    TF_SEH_EXCEPT { p = nullptr; }
+    if (p && (uintptr_t)p > 0x10000ull) return p;
 
-    // Raw pointers: LLeg 0x80 RLeg 0x88 LArm 0x90 RArm 0x98
-    static const int kOff[4] = { 0x90, 0x98, 0x80, 0x88 };
+    // Game offsets for limb HealthPartStatus* (KenshiLib comments)
+    static const int kOff[4] = { 0x90, 0x98, 0x80, 0x88 }; // LArm RArm LLeg RLeg
     MedicalSystem::HealthPartStatus* raw = nullptr;
     std::memcpy(&raw, (const char*)(void*)med + kOff[slot], sizeof(raw));
     if (raw && (uintptr_t)raw > 0x10000ull) return raw;
     return nullptr;
+}
+
+static LimbState ReadLimbState(MedicalSystem* med, int slot)
+{
+    static const RobotLimbs::Limb kEnum[4] = {
+        RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
+        RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
+    };
+    LimbState st = LIMB_ORIGINAL;
+
+    // 1) MedicalSystem::getLimbState — method, layout-safe
+    TF_SEH_TRY { st = med->getLimbState(kEnum[slot]); }
+    TF_SEH_EXCEPT { st = LIMB_ORIGINAL; }
+
+    // 2) RobotLimbs table (raw pointer @ 0xC8)
+    RobotLimbs* robots = GetRobotLimbs(med);
+    if (robots)
+    {
+        TF_SEH_TRY
+        {
+            LimbState t = robots->getState(kEnum[slot]);
+            // Prefer non-original from table when it indicates missing/replaced
+            if (t == LIMB_STUMP || t == LIMB_CRUSHED || t == LIMB_REPLACED)
+                st = t;
+            else if (st == LIMB_ORIGINAL)
+                st = t;
+        }
+        TF_SEH_EXCEPT { }
+    }
+
+    // 3) Part's own state if we have a pointer
+    MedicalSystem::HealthPartStatus* part = ResolveLimb(med, slot);
+    if (part)
+    {
+        TF_SEH_TRY
+        {
+            LimbState ps = part->getRobotLimbState();
+            if (ps == LIMB_STUMP || ps == LIMB_CRUSHED || ps == LIMB_REPLACED)
+                st = ps;
+            else if (st == LIMB_ORIGINAL)
+                st = ps;
+        }
+        TF_SEH_EXCEPT { }
+    }
+    return st;
 }
 
 static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
@@ -574,21 +638,40 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
 
     TF_SEH_TRY
     {
+        // Always emit all 4 slots — missing limbs often have NULL part*
         for (int i = 0; i < 4 && n < maxOut; ++i)
         {
             LimbInfo& L = out[n];
             std::memset(&L, 0, sizeof(L));
             std::snprintf(L.name, sizeof(L.name), "%s", kNames[i]);
 
+            LimbState st = ReadLimbState(med, i);
             MedicalSystem::HealthPartStatus* part = ResolveLimb(med, i);
-            if (!part)
+
+            float maxHp = 100.f;
+            float raw = 0.f;
+            int robotic = 0;
+
+            if (part)
             {
-                std::snprintf(L.stage, sizeof(L.stage), "n/a");
-                std::snprintf(L.detail, sizeof(L.detail), "-");
-                ++n;
-                continue;
+                TF_SEH_TRY
+                {
+                    if (part->isRobotic()) robotic = 1;
+                    maxHp = part->maxHealth();
+                    if (maxHp < 1.f) maxHp = part->_maxHealth;
+                    if (maxHp < 1.f) maxHp = 100.f;
+                    raw = part->flesh;
+                    if (raw != raw) raw = 0.f;
+                }
+                TF_SEH_EXCEPT
+                {
+                    part = nullptr;
+                    raw = 0.f;
+                    maxHp = 100.f;
+                }
             }
-            if (part->isRobotic())
+
+            if (robotic || st == LIMB_REPLACED)
             {
                 std::snprintf(L.stage, sizeof(L.stage), "Prosthetic");
                 std::snprintf(L.detail, sizeof(L.detail), "Feast ignores");
@@ -596,24 +679,36 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
                 continue;
             }
 
-            LimbState st = part->getRobotLimbState();
-            float maxHp = part->maxHealth();
-            if (maxHp < 1.f) maxHp = part->_maxHealth;
-            if (maxHp < 1.f) maxHp = 100.f;
-            float raw = part->flesh;
-            if (raw != raw) raw = 0.f;
             float pos = raw > 0.f ? raw : 0.f;
             float pct = pos / maxHp;
             if (pct > 1.2f) pct = 1.2f;
+
+            // No part pointer + crushed/stump OR negative flesh on HUD = missing
+            if (st == LIMB_CRUSHED || (!part && st != LIMB_ORIGINAL && st != LIMB_REPLACED))
+            {
+                // Treat unknown-null as missing when HUD would show a bar at -HP
+                if (st != LIMB_STUMP) st = LIMB_CRUSHED;
+            }
+            // If part null and state still ORIGINAL, still list as "OK?" — better than blank
+            // But user missing limbs: getLimbState should return STUMP/CRUSHED
 
             if (st == LIMB_CRUSHED)
             {
                 float prog = (g_cfg.limbStumpFormPct > 0.01f)
                     ? (pos / maxHp) / g_cfg.limbStumpFormPct : 0.f;
                 if (prog > 1.f) prog = 1.f;
-                std::snprintf(L.stage, sizeof(L.stage), "Missing");
-                std::snprintf(L.detail, sizeof(L.detail),
-                    "→stump %.0f%%  HP %.0f", prog * 100.f, raw);
+                if (!part && prog < 0.01f)
+                {
+                    // Fully gone — no part to bud on yet; show waiting for stump form
+                    std::snprintf(L.stage, sizeof(L.stage), "Missing");
+                    std::snprintf(L.detail, sizeof(L.detail), "forming stump 0%%");
+                }
+                else
+                {
+                    std::snprintf(L.stage, sizeof(L.stage), "Missing");
+                    std::snprintf(L.detail, sizeof(L.detail),
+                        "to stump %.0f%%", prog * 100.f);
+                }
                 L.active = 1;
                 L.missing = 1;
                 L.severity = 1.0f;
@@ -625,19 +720,21 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
                 if (prog > 1.f) prog = 1.f;
                 std::snprintf(L.stage, sizeof(L.stage), "Stump");
                 std::snprintf(L.detail, sizeof(L.detail),
-                    "bud %.0f%%  HP %.0f", prog * 100.f, raw);
+                    "bud %.0f%%", prog * 100.f);
                 L.active = 1;
                 L.missing = 1;
                 L.severity = 0.92f;
             }
-            else if (st == LIMB_REPLACED)
-            {
-                std::snprintf(L.stage, sizeof(L.stage), "Replaced");
-                std::snprintf(L.detail, sizeof(L.detail), "robot limb");
-            }
             else
             {
-                if (pct < g_cfg.limbRestoredStart + 0.06f)
+                // ORIGINAL (or unknown with part)
+                if (!part)
+                {
+                    // State says original but no part — still show something
+                    std::snprintf(L.stage, sizeof(L.stage), "OK");
+                    std::snprintf(L.detail, sizeof(L.detail), "no part data");
+                }
+                else if (pct < g_cfg.limbRestoredStart + 0.06f)
                 {
                     std::snprintf(L.stage, sizeof(L.stage), "Fragile");
                     std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%", pct * 100.f);
@@ -832,9 +929,15 @@ static void ProcessLimbs(
     float budget = g_cfg.limbRegrowPerSec * power * dt;
     if (budget <= 0.f) return;
 
-    RobotLimbs* robots = med->robotLimbs;
+    RobotLimbs* robots = GetRobotLimbs(med);
     // Without robotLimbs we cannot change limb state (stump/restore)
-    if (!robots) return;
+    if (!robots)
+    {
+        static int s_nr = 0;
+        if (g_cfg.debugLog && (++s_nr % 40) == 1)
+            Log("ToughnessFeast: robotLimbs null @0xC8 — cannot setLimb");
+        return;
+    }
 
     static const RobotLimbs::Limb kEnum[4] = {
         RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
@@ -845,28 +948,36 @@ static void ProcessLimbs(
     {
         for (int i = 0; i < 4; ++i)
         {
+            LimbState eff = ReadLimbState(med, i);
+            if (eff == LIMB_REPLACED) continue;
+            LimbState st = eff;
+
             MedicalSystem::HealthPartStatus* part = ResolveLimb(med, i);
-            if (!part) continue;
-            if (part->isRobotic()) continue;
+            if (part)
+            {
+                int rob = 0;
+                TF_SEH_TRY { rob = part->isRobotic() ? 1 : 0; }
+                TF_SEH_EXCEPT { rob = 0; }
+                if (rob) continue;
+            }
 
-            LimbState st = part->getRobotLimbState();
-            LimbState table = robots->getState(kEnum[i]);
-            // Prefer robotLimbs table when it disagrees (authoritative for setLimb)
-            if (table == LIMB_REPLACED || st == LIMB_REPLACED) continue;
-            // Use table state when it's crushed/stump even if part says otherwise
-            LimbState eff = st;
-            if (table == LIMB_CRUSHED || table == LIMB_STUMP)
-                eff = table;
-            else if (st == LIMB_ORIGINAL && (table == LIMB_ORIGINAL || table == LIMB_ORIGINAL))
-                eff = st;
-
-            float maxHp = part->maxHealth();
-            if (maxHp < 1.f) maxHp = part->_maxHealth;
-            if (maxHp < 1.f || maxHp > 10000.f) continue;
-
-            float flesh = part->flesh;
-            if (flesh != flesh) continue;
-            if (flesh > maxHp * 3.f) flesh = maxHp;
+            float maxHp = 100.f;
+            float flesh = 0.f;
+            if (part)
+            {
+                maxHp = part->maxHealth();
+                if (maxHp < 1.f) maxHp = part->_maxHealth;
+                if (maxHp < 1.f || maxHp > 10000.f) maxHp = 100.f;
+                flesh = part->flesh;
+                if (flesh != flesh) flesh = 0.f;
+                if (flesh > maxHp * 3.f) flesh = maxHp;
+            }
+            else if (eff != LIMB_CRUSHED && eff != LIMB_STUMP)
+            {
+                // No part and looks intact — skip
+                continue;
+            }
+            // Missing with null part: still allow setLimb(STUMP) path
 
             // ========== CRUSHED / fully missing ==========
             // Heal overdamage, bud a nub, then form a STUMP (missing → stump).
@@ -874,6 +985,25 @@ static void ProcessLimbs(
             {
                 if (worstSev < 1.f) worstSev = 1.f;
                 float rate = 0.50f;
+
+                // No HealthPartStatus (fully severed) — form stump directly via setLimb
+                if (!part)
+                {
+                    robots->setLimb(kEnum[i], LIMB_STUMP, nullptr);
+                    part = ResolveLimb(med, i);
+                    if (part)
+                    {
+                        float nub = maxHp * 0.04f;
+                        if (nub < 1.f) nub = 1.f;
+                        part->flesh = nub;
+                        TF_SEH_TRY { part->updateDerivedHealths(); }
+                        TF_SEH_EXCEPT { }
+                    }
+                    anyHeal = 1;
+                    SpendHungerAndKnockout(med, g_cfg.stumpHungerCost, g_cfg.stumpKoSeconds,
+                        "formed STUMP (no part)");
+                    continue;
+                }
 
                 if (flesh < 0.f)
                 {
@@ -1257,14 +1387,16 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
 
     StripOldFeastBlock(dats);
 
+    // Carve room for full journal — limbs first so they always fit
     unsigned need = (unsigned)g_cfg.tooltipMaxLines;
-    if (need + 2 > dats->maxSize)
-        need = dats->maxSize > 4 ? dats->maxSize - 2 : 0;
+    if (need < 14) need = 14;
+    if (need + 1 > dats->maxSize)
+        need = dats->maxSize > 3 ? dats->maxSize - 1 : 0;
     if (need > 0 && dats->count + need > dats->maxSize)
         dats->count = dats->maxSize - need;
 
     unsigned start = dats->count;
-    unsigned budget = need > 0 ? need : 12;
+    unsigned budget = need > 0 ? need : 14;
 
     auto room = [&]() -> int {
         return (dats->count < dats->maxSize && dats->count - start < budget) ? 1 : 0;
@@ -1288,12 +1420,51 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
         if (h == h && h >= 0.f && h <= 5.f) hungerPct = h * 100.f;
     }
 
-    line("== Feast ==", "Hunger tip");
-    line("Race", RaceName(rk));
+    line("== Feast ==", "live");
     {
         char r[40];
-        std::snprintf(r, sizeof(r), "%d  (cap %.0f)", tInt, g_cfg.combatCap);
+        std::snprintf(r, sizeof(r), "%d (cap %.0f)", tInt, g_cfg.combatCap);
         line("Toughness", r);
+    }
+    line("Race", RaceName(rk));
+
+    // LIMBS FIRST (priority) — always try even if dead flag weird
+    LimbInfo limbs[4];
+    int nLimbs = 0;
+    if (med)
+        nLimbs = CollectLimbs(stats, limbs, 4);
+
+    int active = 0, missing = 0;
+    line("-- Limbs --", "4 slots");
+    if (nLimbs <= 0)
+    {
+        line("Limbs", "scan failed");
+        // Still print placeholders so user sees the section
+        line("Left Arm", "?");
+        line("Right Arm", "?");
+        line("Left Leg", "?");
+        line("Right Leg", "?");
+    }
+    else
+    {
+        for (int i = 0; i < nLimbs; ++i)
+        {
+            if (limbs[i].active) ++active;
+            if (limbs[i].missing) ++missing;
+            char right[56];
+            std::snprintf(right, sizeof(right), "%s %s", limbs[i].stage, limbs[i].detail);
+            line(limbs[i].name, right);
+        }
+    }
+    {
+        char r[48];
+        if (missing > 0)
+            std::snprintf(r, sizeof(r), "%d missing", missing);
+        else if (active > 0)
+            std::snprintf(r, sizeof(r), "%d mending", active);
+        else
+            std::snprintf(r, sizeof(r), "all sound");
+        line("Summary", r);
     }
 
     if (rk == RACE_ROBOT)
@@ -1314,9 +1485,9 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
     {
         char r[48];
         float drain = g_cfg.hungerDrainPerSec * power * 100.f;
-        std::snprintf(r, sizeof(r), "ON  pwr %.2f", power);
+        std::snprintf(r, sizeof(r), "ON pwr %.2f", power);
         line("Feast", r);
-        std::snprintf(r, sizeof(r), "~%.1f%%/s while healing", drain);
+        std::snprintf(r, sizeof(r), "~%.1f%%/s heal", drain);
         line("Food use", r);
     }
 
@@ -1328,47 +1499,17 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
         line("Hunger", r);
     }
 
-    {
-        char r[40];
-        std::snprintf(r, sizeof(r), "DR soft-cap %.0f", g_cfg.combatCap);
-        line("Combat", r);
-    }
-
-    LimbInfo limbs[4];
-    int n = 0;
-    if (med && !med->dead) n = CollectLimbs(stats, limbs, 4);
-
-    int active = 0, missing = 0;
-    line("-- Limbs --", "stage");
-    if (n <= 0)
-        line("Limbs", "no data");
-    else
-    {
-        for (int i = 0; i < n; ++i)
-        {
-            if (limbs[i].active) ++active;
-            if (limbs[i].missing) ++missing;
-            char right[56];
-            std::snprintf(right, sizeof(right), "%s  %s", limbs[i].stage, limbs[i].detail);
-            line(limbs[i].name, right);
-        }
-        char r[40];
-        if (active <= 0) std::snprintf(r, sizeof(r), "all sound");
-        else if (missing > 0) std::snprintf(r, sizeof(r), "%d missing, %d mending", missing, active);
-        else std::snprintf(r, sizeof(r), "%d mending", active);
-        line("Summary", r);
-    }
-
-    if (active > 0)
-        line("Fight note", "weak limbs hurt combat");
+    if (active > 0 || missing > 0)
+        line("Note", "stage done = food dump + KO");
     line("== end ==", "hover Hunger");
 
     static int tipLog = 0;
-    if (g_cfg.debugLog && ((++tipLog) % 8) == 1)
+    if (g_cfg.debugLog && ((++tipLog) % 5) == 1)
     {
-        char msg[128];
+        char msg[160];
         std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: journal t=%d p=%.2f limbs=%d", tInt, power, n);
+            "ToughnessFeast: journal t=%d limbs=%d miss=%d act=%d",
+            tInt, nLimbs, missing, active);
         Log(msg);
     }
 }
