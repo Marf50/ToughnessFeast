@@ -980,9 +980,12 @@ static void ProcessLimbRegrowth(
     }
 }
 
+static int g_inFoodRegen = 0;
+
 static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
 {
     if (!g_cfg.enableMedicalHooks) return;
+    if (g_inFoodRegen) return;
     if (!stats) return;
     if (frameTime <= 0.f) return;
     if (frameTime > 0.25f) frameTime = 0.25f;
@@ -1018,6 +1021,7 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
     float worstSeverity = 0.f;
 
     // --- staged limb restore (slow) ---
+    g_inFoodRegen = 1;
     ProcessLimbRegrowth(med, stats, power, frameTime, hungerCost, anyHeal, worstSeverity);
 
     // --- general flesh wounds (non-limb / residual) via getPart index ---
@@ -1102,9 +1106,9 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
         ApplyRegrowthCombatPenalty(stats, worstSeverity);
     }
 
-    // HUD: show selected/this character stage progress
     g_lastStats = stats;
     RefreshStatusHud(stats);
+    g_inFoodRegen = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,30 +1118,30 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
 static float (*calculateToughnessDamageResistanceMult_orig)(CharStats*) = nullptr;
 static float calculateToughnessDamageResistanceMult_hook(CharStats* self)
 {
+    // Soft-cap combat DR only. NEVER limb regen / setLimb here (mid-hit crash).
     if (!self || !calculateToughnessDamageResistanceMult_orig)
         return 1.f;
     float saved = self->_toughness;
-    if (saved > g_cfg.combatCapToughness)
+    if (saved > g_cfg.combatCapToughness && saved < 500.f)
         self->_toughness = g_cfg.combatCapToughness;
     float r = calculateToughnessDamageResistanceMult_orig(self);
     self->_toughness = saved;
-    if (g_cfg.enableMedicalHooks)
-        ApplyFoodRegenFromStats(self, 0.02f);
+    if (r != r || r < 0.f) r = 1.f;
     return r;
 }
 
 static float (*calculateToughnessWoundDegenerationRate_orig)(CharStats*) = nullptr;
 static float calculateToughnessWoundDegenerationRate_hook(CharStats* self)
 {
+    // Soft-cap wound degen only — no medical writes (combat-safe).
     if (!self || !calculateToughnessWoundDegenerationRate_orig)
         return 1.f;
     float saved = self->_toughness;
-    if (saved > g_cfg.combatCapToughness)
+    if (saved > g_cfg.combatCapToughness && saved < 500.f)
         self->_toughness = g_cfg.combatCapToughness;
     float r = calculateToughnessWoundDegenerationRate_orig(self);
     self->_toughness = saved;
-    if (g_cfg.enableMedicalHooks)
-        ApplyFoodRegenFromStats(self, 0.05f);
+    if (r != r || r < 0.f) r = 1.f;
     return r;
 }
 
@@ -1170,21 +1174,36 @@ static void (*xpStat_timeBased_orig)(CharStats*, StatsEnumerated) = nullptr;
 static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
 {
     if (!xpStat_timeBased_orig) return;
-    if (!self || st != STAT_TOUGHNESS)
+    if (!self)
     {
         xpStat_timeBased_orig(self, st);
         return;
     }
-    float before = self->_toughness;
-    xpStat_timeBased_orig(self, st);
-    if (before >= 99.5f && self->_toughness <= before + 0.0001f)
+
+    if (st == STAT_TOUGHNESS)
     {
-        float over = (before > 100.f) ? (before - 100.f) : 0.f;
-        float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
-        self->_toughness = before + 0.002f * mult;
+        float before = self->_toughness;
+        xpStat_timeBased_orig(self, st);
+        if (before >= 99.5f && self->_toughness <= before + 0.0001f)
+        {
+            float over = (before > 100.f) ? (before - 100.f) : 0.f;
+            float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
+            self->_toughness = before + 0.002f * mult;
+        }
     }
+    else
+    {
+        xpStat_timeBased_orig(self, st);
+    }
+
+    // Limb/food regen ONLY here (periodic), never on DR/hit.
+    // Throttle so we do not re-enter medical every single stat tick.
     if (g_cfg.enableMedicalHooks)
-        ApplyFoodRegenFromStats(self, 0.1f);
+    {
+        static int s_regenThrottle = 0;
+        if ((++s_regenThrottle % 8) == 0)
+            ApplyFoodRegenFromStats(self, 0.12f);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,8 +1227,12 @@ static bool getStatPenaltiesForGUI_hook(CharStats* self, const std::string& stat
     if (getStatPenaltiesForGUI_orig)
         r = getStatPenaltiesForGUI_orig(self, statName, stat, dats);
     // Do not read statName (CRT ABI). Use enum only.
-    if (g_cfg.enableTooltips && self && stat == STAT_TOUGHNESS)
-        AppendToughnessTooltips(&dats, self);
+    if (g_cfg.enableTooltips && self && stat == STAT_TOUGHNESS && !g_inFoodRegen)
+    {
+        // leave room in lektor; skip if nearly full (avoids overflow crash)
+        if (dats.maxSize > 0 && dats.count + 8u < dats.maxSize)
+            AppendToughnessTooltips(&dats, self);
+    }
     return r;
 }
 
@@ -1218,8 +1241,11 @@ static void printExertionHungerMultTooltip_hook(CharStats* self, lektor<StringPa
 {
     if (printExertionHungerMultTooltip_orig)
         printExertionHungerMultTooltip_orig(self, dats);
-    if (g_cfg.enableTooltips && self && dats)
-        AppendHungerTooltips(dats, self);
+    if (g_cfg.enableTooltips && self && dats && !g_inFoodRegen)
+    {
+        if (dats->maxSize > 0 && dats->count + 12u < dats->maxSize)
+            AppendHungerTooltips(dats, self);
+    }
 }
 #endif
 
@@ -1375,5 +1401,5 @@ TF_EXPORT void startPlugin()
     }
 
     InstallHooks();
-    DebugLog("ToughnessFeast: ready (tooltips, no GUI window)");
+    DebugLog("ToughnessFeast: ready (combat-safe: no regen on hit)");
 }
