@@ -1,8 +1,3 @@
-# Builds ToughnessFeast.dll on a free GitHub-hosted Windows runner.
-# You do NOT need a Windows PC: push this repo → Actions → download the artifact.
-#
-# Trigger: push, or Actions → "Build Windows DLL" → Run workflow
-
 name: Build Windows DLL
 
 on:
@@ -16,8 +11,8 @@ permissions:
 jobs:
   build:
     name: MSVC x64 Release
-    runs-on: windows-latest
-    timeout-minutes: 30
+    runs-on: windows-2022
+    timeout-minutes: 45
 
     steps:
       - name: Checkout plugin source
@@ -27,11 +22,12 @@ jobs:
         run: git lfs install
 
       - name: Clone KenshiLib deps (with LFS binaries)
+        shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git "${{ runner.temp }}\kenshi_deps"
-          cd "${{ runner.temp }}\kenshi_deps"
+          $deps = Join-Path $env:RUNNER_TEMP "kenshi_deps"
+          git clone --depth 1 https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git $deps
+          Push-Location $deps
           git lfs pull
-          # Extract Boost 1.60 headers used by KenshiLib includes
           if (Test-Path "boost_1_60_0\boost.zip") {
             tar -xf "boost_1_60_0\boost.zip" --directory "boost_1_60_0"
           }
@@ -40,13 +36,18 @@ jobs:
             throw "KenshiLib.lib looks like an LFS pointer ($($lib.Length) bytes). git lfs pull failed."
           }
           Write-Host "KenshiLib.lib size: $($lib.Length)"
+          if (-not (Test-Path "boost_1_60_0\boost")) {
+            throw "Boost headers missing after extract"
+          }
+          Pop-Location
+          "KENSHI_DEPS=$deps" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Configure CMake (MSVC x64)
-        shell: cmd
+        shell: pwsh
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
-            -DKENSHILIB_DIR=%RUNNER_TEMP%\kenshi_deps\KenshiLib ^
-            -DBOOST_INCLUDE_DIR=%RUNNER_TEMP%\kenshi_deps\boost_1_60_0 ^
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            "-DKENSHILIB_DIR=$env:KENSHI_DEPS\KenshiLib" `
+            "-DBOOST_INCLUDE_DIR=$env:KENSHI_DEPS\boost_1_60_0" `
             -DTOUGHNESSFEAST_FORCE_GAME_BUILD=ON
 
       - name: Build Release
