@@ -31,7 +31,6 @@
 #include <kenshi/util/hand.h>
 #include <mygui/MyGUI_Gui.h>
 #include <mygui/MyGUI_Window.h>
-#include <kenshi/gui/TitleScreen.h>
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_Widget.h>
@@ -413,11 +412,14 @@ static void CreateStatusHudForced()
 #else
     if (!g_cfg.showStatusHud) return;
     if (g_hudWindow) return;
+    if (g_hudCreateAttempts > 60) return;
+    ++g_hudCreateAttempts;
 
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     if (!gui)
     {
-        DebugLog("ToughnessFeast: MyGUI not ready yet");
+        if (g_hudCreateAttempts == 1 || (g_hudCreateAttempts % 20) == 0)
+            DebugLog("ToughnessFeast: MyGUI not ready yet");
         return;
     }
 
@@ -511,22 +513,6 @@ static void RefreshStatusHud(CharStats* preferStats)
     EnsureStatusHud();
     SetHudCaption(g_statusText);
 }
-
-#if !defined(TOUGHNESSFEAST_LINUX_IDE)
-static TitleScreen* (*TitleScreen_ctor_orig)(TitleScreen*) = nullptr;
-static TitleScreen* TitleScreen_ctor_hook(TitleScreen* self)
-{
-    TitleScreen* r = TitleScreen_ctor_orig ? TitleScreen_ctor_orig(self) : self;
-    DebugLog("ToughnessFeast: TitleScreen ctor — creating HUD");
-    std::snprintf(g_statusText, sizeof(g_statusText),
-        "=== Toughness Feast ===\n"
-        "Load a save / select a character\n"
-        "to see limb regrowth progress.\n");
-    CreateStatusHudForced();
-    SetHudCaption(g_statusText);
-    return r;
-}
-#endif
 
 // ---------- gameplay (only used if EnableHooks=1) ----------
 //
@@ -1088,18 +1074,10 @@ static void InstallHooks()
     else
         DebugLog("ToughnessFeast: food regen OFF (EnableMedicalHooks=0)");
 
-#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    // HUD: NO TitleScreen hook (that hung game on launch).
+    // Create lazily when CharStats hooks run in-world and MyGUI is ready.
     if (g_cfg.showStatusHud)
-    {
-        // TitleScreen::_CONSTRUCTOR → TitleScreen* (this)
-        HookExport("?_CONSTRUCTOR@TitleScreen@@QEAAPEAV1@XZ",
-                   (void*)TitleScreen_ctor_hook,
-                   (void**)&TitleScreen_ctor_orig,
-                   "ToughnessFeast: hooked TitleScreen for HUD");
-        // Try create immediately if already in-game / GUI up
-        CreateStatusHudForced();
-    }
-#endif
+        DebugLog("ToughnessFeast: status HUD will create in-world when MyGUI is ready");
 }
 
 #if defined(_MSC_VER)
@@ -1123,5 +1101,5 @@ TF_EXPORT void startPlugin()
     }
 
     InstallHooks();
-    DebugLog("ToughnessFeast: ready (staged limb restore + status HUD)");
+    DebugLog("ToughnessFeast: ready (limb restore; HUD lazy in-world)");
 }
