@@ -37,18 +37,22 @@ enum StatsEnumerated { STAT_TOUGHNESS = 0 };
 enum LimbState { LIMB_ORIGINAL = 0, LIMB_STUMP = 1, LIMB_REPLACED = 2, LIMB_CRUSHED = 3 };
 enum LeftRight { LEFT, RIGHT };
 
-class Character; class CharStats; class MedicalSystem; class RaceData; class Item;
+class Character; class CharStats; class MedicalSystem; class RaceData; class Item; class GameData;
 
+class GameData { public: char pad[0x58]; };
 class RaceData {
 public:
   float hungerRate=1.f, healRate=1.f;
   bool gigantic=false, robot=false;
+  bool noHats=false, noShirts=false, noShoes=false, singleGender=false;
+  GameData* data=nullptr;
 };
 class Character {
 public:
   bool amSomeoneWhoNeedsToEatToLive(){return true;}
   RaceData* getRace()const{return nullptr;}
   CharStats* stats=nullptr;
+  RaceData* myRace=nullptr;
   CharStats* getStats(){return stats;}
 };
 class RobotLimbs {
