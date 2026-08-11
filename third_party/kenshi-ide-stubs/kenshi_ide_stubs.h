@@ -14,6 +14,8 @@ using DWORD=unsigned long; using HMODULE=void*; using LPCSTR=const char*; using 
 #define GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 2
 #endif
 inline BOOL GetModuleHandleExA(DWORD,LPCSTR,HMODULE*o){if(o)*o=0;return 0;}
+inline void* GetProcAddress(void*, const char*){return nullptr;}
+inline void* GetModuleHandleA(const char*){return nullptr;}
 inline DWORD GetModuleFileNameA(HMODULE,LPSTR b,DWORD s){if(b&&s)b[0]=0;return 0;}
 inline void DebugLog(const char*){}
 inline void ErrorLog(const char*){}
@@ -37,6 +39,8 @@ public:
 };
 class CharStats {
 public:
+  MedicalSystem* medical=nullptr;
+  Character* me=nullptr;
   float _toughness=0;
   float calculateToughnessDamageResistanceMult(){return 1;}
   float calculateToughnessWoundDegenerationRate(){return 1;}
