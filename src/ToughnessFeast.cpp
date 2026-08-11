@@ -396,6 +396,45 @@ static void SetToughness(CharStats* stats, float t)
 
 enum RaceKind { RACE_UNKNOWN=0, RACE_HUMAN, RACE_SHEK, RACE_HIVER, RACE_ROBOT };
 
+// CharStats::medical is at game +0x8 (NOT compiler map offsetof)
+static MedicalSystem* MedFromStats(CharStats* stats)
+{
+    if (!stats) return nullptr;
+    MedicalSystem* m = nullptr;
+    std::memcpy(&m, (const char*)(void*)stats + 0x8, sizeof(m));
+    if (!m || (uintptr_t)m < 0x10000ull) return nullptr;
+    return m;
+}
+
+static int MedIsDead(MedicalSystem* med)
+{
+    if (!med) return 1;
+    unsigned char dead = 0;
+    // MedicalSystem::dead @ game 0x164
+    TF_SEH_TRY { std::memcpy(&dead, (const char*)(void*)med + 0x164, 1); }
+    TF_SEH_EXCEPT { return 0; } // don't kill feast on bad read
+    return dead ? 1 : 0;
+}
+
+static float MedHunger(MedicalSystem* med)
+{
+    if (!med) return 0.f;
+    float h = 0.f;
+    // hunger @ 0x60
+    TF_SEH_TRY { std::memcpy(&h, (const char*)(void*)med + 0x60, sizeof(h)); }
+    TF_SEH_EXCEPT { return 0.f; }
+    if (h != h || h < 0.f) return 0.f;
+    return h;
+}
+
+static void MedSetHunger(MedicalSystem* med, float h)
+{
+    if (!med) return;
+    if (h != h || h < 0.f) h = 0.f;
+    TF_SEH_TRY { std::memcpy((char*)(void*)med + 0x60, &h, sizeof(h)); }
+    TF_SEH_EXCEPT { }
+}
+
 static CharStats* StatsFromMedical(MedicalSystem* med)
 {
     if (!med) return nullptr;
@@ -661,6 +700,8 @@ static int IsPlayerSide(Character* me)
         else if (me->isWithThePlayer()) ok = 1;
     }
     TF_SEH_EXCEPT { ok = 0; }
+    // If virtual calls fail (SEH), don't drop feast forever for the player med
+    // Caller already scoped to medicalUpdate of this character.
     return ok;
 }
 
@@ -1075,7 +1116,7 @@ static LimbState ReadLimbState(MedicalSystem* med, int slot)
 static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
 {
     if (!stats || !out || maxOut <= 0) return 0;
-    MedicalSystem* med = stats->medical;
+    MedicalSystem* med = MedFromStats(stats);
     if (!med) return 0;
 
     static const char* kNames[4] = { "Left Arm", "Right Arm", "Left Leg", "Right Leg" };
@@ -1277,58 +1318,99 @@ static int g_inRegen = 0;
 static void ApplyFeastTick(CharStats* stats, float dt); // fwd
 
 // SINGLE feast driver: MedicalSystem::medicalUpdate only (throttled).
-// No damage hooks, no periodic double-hook, no tip-side setLimb spam.
+// Watchdog clears stuck g_inRegen; raw offsets for medical/stats/dead/hunger.
 static void DriveFeastFromMedical(MedicalSystem* med, float dt)
 {
-    if (!g_cfg.enableMedical || !med || g_inRegen) return;
+    if (!g_cfg.enableMedical || !med) return;
     if (dt != dt || dt <= 0.f) return;
 
-    // Throttle: at most ~3 Hz per MedicalSystem* (avoid assert spam / re-entry)
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
-    struct Slot { MedicalSystem* med; unsigned lastMs; float accum; };
-    static Slot slots[48];
-    static int nSlots = 0;
     unsigned now = GetTickCount();
+
+    // If a previous tick crashed/re-entered without clearing, unstick after 1.5s
+    static unsigned s_regenSince = 0;
+    if (g_inRegen)
+    {
+        if (s_regenSince == 0) s_regenSince = now;
+        if ((now - s_regenSince) > 1500u)
+        {
+            g_inRegen = 0;
+            s_regenSince = 0;
+            Log("ToughnessFeast: cleared stuck g_inRegen");
+        }
+        else
+            return;
+    }
+    else
+        s_regenSince = 0;
+
+    // Per-med throttle (~3 Hz). Ring buffer so NPC flood never locks us out.
+    struct Slot { MedicalSystem* med; unsigned lastMs; float accum; };
+    static Slot slots[64];
+    static int nSlots = 0;
+    static int slotClock = 0;
     Slot* s = nullptr;
     for (int i = 0; i < nSlots; ++i)
         if (slots[i].med == med) { s = &slots[i]; break; }
-    if (!s && nSlots < 48)
+    if (!s)
     {
-        s = &slots[nSlots++];
+        if (nSlots < 64)
+        {
+            s = &slots[nSlots++];
+        }
+        else
+        {
+            // Reuse oldest slot (round-robin) — player still gets a slot
+            s = &slots[slotClock++ % 64];
+        }
         s->med = med;
         s->lastMs = 0;
         s->accum = 0.f;
     }
     float useDt = dt;
-    if (s)
+    if (s->lastMs != 0 && (now - s->lastMs) < 300u)
     {
-        if (s->lastMs != 0 && (now - s->lastMs) < 350u)
-        {
-            s->accum += dt;
-            return;
-        }
-        useDt = s->accum + dt;
-        s->accum = 0.f;
-        s->lastMs = now;
+        s->accum += dt;
+        return;
     }
+    useDt = s->accum + dt;
+    s->accum = 0.f;
+    s->lastMs = now;
 #else
+    if (g_inRegen) return;
     float useDt = dt;
 #endif
     if (useDt > 0.40f) useDt = 0.40f;
     if (useDt < 0.08f) useDt = 0.08f;
 
+    if (MedIsDead(med)) return;
+
     CharStats* stats = StatsFromMedical(med);
     if (!stats) return;
 
-    // Only player / player squad — medicalUpdate runs for every character
     Character* me = nullptr;
     std::memcpy(&me, (const char*)(void*)med + 0xE0, sizeof(me));
     if (!IsPlayerSide(me)) return;
+
+    // Heartbeat so log proves feast is alive (every ~30s)
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    static unsigned s_hb = 0;
+    if (g_cfg.debugLog && (s_hb == 0 || (now - s_hb) > 30000u))
+    {
+        s_hb = now;
+        char msg[120];
+        std::snprintf(msg, sizeof(msg),
+            "ToughnessFeast: heartbeat t=%.0f p=%.2f hunger=%.2f",
+            GetToughness(stats), FeastPower(stats), MedHunger(med));
+        Log(msg);
+    }
+#endif
 
     ApplyFeastTick(stats, useDt);
 }
 
 static void (*orig_medUpdate)(MedicalSystem*, float) = nullptr;
+
 static void hook_medUpdate(MedicalSystem* self, float frameTime)
 {
     // Always run original first — never skip game medical
@@ -1418,17 +1500,16 @@ static void SpendHungerAndKnockout(MedicalSystem* med, float hungerFrac, float k
     if (hungerFrac < 0.f) hungerFrac = 0.f;
     if (hungerFrac > 0.95f) hungerFrac = 0.95f;
 
-    float h = med->hunger;
+    float h = MedHunger(med);
     float spent = 0.f;
     if (h == h && h >= 0.f && h < 1e6f)
     {
         float full = HungerFullEstimate(h);
         spent = full * hungerFrac;
-        // If value looks 0..1, spend fraction directly (same math)
-        if (h <= 5.f) spent = hungerFrac; // frac of bar where full=1
+        if (h <= 5.f) spent = hungerFrac; // 0..1 bar
         h -= spent;
         if (h < 0.f) h = 0.f;
-        med->hunger = h;
+        MedSetHunger(med, h);
     }
 
     if (koSeconds > 0.f)
@@ -1777,12 +1858,12 @@ static void ApplyFeastTick(CharStats* stats, float dt)
     if (!stats || dt <= 0.f) return;
     if (dt > 0.25f) dt = 0.25f;
 
-    MedicalSystem* med = stats->medical;
-    if (!med || med->dead) return;
+    // ALWAYS use game offset for medical pointer (compiler offsetof is wrong)
+    MedicalSystem* med = MedFromStats(stats);
+    if (!med) return;
+    if (MedIsDead(med)) return;
 
     Character* me = CharFromStats(stats);
-    // Do NOT early-out on amSomeoneWhoNeedsToEatToLive for limb stage completion —
-    // that gate previously blocked restores entirely for some races / states.
     int needsFood = 1;
     if (me)
     {
@@ -1791,8 +1872,9 @@ static void ApplyFeastTick(CharStats* stats, float dt)
     }
 
     float power = FeastPower(stats);
-    float hunger = med->hunger;
-    if (hunger != hunger || hunger < 0.f || hunger > 5.f) hunger = 1.f;
+    float hunger = MedHunger(med);
+    // Keep real hunger for 0..1 and large (~300) scales — do NOT clamp to 1.f
+    if (hunger != hunger || hunger < 0.f) hunger = 0.f;
 
     // Gradual growth needs power + hunger + organic eater.
     // Stage completions (READY stump) always allowed.
@@ -1847,6 +1929,8 @@ static void ApplyFeastTick(CharStats* stats, float dt)
     }
 
     g_inRegen = 1;
+    TF_SEH_TRY
+    {
 
     float fleshBudget = allowGrow ? (g_cfg.fleshHealPerSec * power * dt) : 0.f;
     float stunBudget  = allowGrow ? (g_cfg.stunHealPerSec * power * dt) : 0.f;
@@ -1913,26 +1997,30 @@ static void ApplyFeastTick(CharStats* stats, float dt)
         {
             float drain = hungerCost * g_cfg.hungerDrainPerSec * 0.02f;
             if (drain > 0.08f) drain = 0.08f;
-            float h = med->hunger - drain;
+            float h = MedHunger(med) - drain;
             if (h < 0.f) h = 0.f;
-            med->hunger = h;
+            MedSetHunger(med, h);
         }
 
         if (worstSev > 0.05f)
             ApplyWeakLimbPenalty(stats, worstSev);
     }
 
-    g_inRegen = 0;
-
-    static int logCd = 0;
-    if (g_cfg.debugLog && anyHeal && (++logCd % 25) == 0)
-    {
-        char msg[160];
-        std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: feast t=%.0f p=%.2f sev=%.2f",
-            GetToughness(stats), power, worstSev);
-        Log(msg);
+        static int logCd = 0;
+        if (g_cfg.debugLog && anyHeal && (++logCd % 25) == 0)
+        {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                "ToughnessFeast: feast t=%.0f p=%.2f sev=%.2f",
+                GetToughness(stats), power, worstSev);
+            Log(msg);
+        }
     }
+    TF_SEH_EXCEPT
+    {
+        LogErr("ToughnessFeast: ApplyFeastTick SEH — clearing regen guard");
+    }
+    g_inRegen = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2106,6 +2194,28 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
     int nLimbs = 0;
     if (med)
         nLimbs = CollectLimbs(stats, limbs, 4);
+
+    // TIP_BACKUP_FEAST: if medical tick ever stalls, hovering Hunger keeps feast alive
+    {
+        static unsigned s_tipTick = 0;
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+        unsigned now = GetTickCount();
+        if (s_tipTick == 0 || (now - s_tipTick) >= 1000u)
+        {
+            s_tipTick = now;
+            // Clear stuck guard before tip-driven tick
+            if (g_inRegen)
+            {
+                g_inRegen = 0;
+                Log("ToughnessFeast: tip cleared stuck g_inRegen");
+            }
+            TF_SEH_TRY { ApplyFeastTick(stats, 0.20f); }
+            TF_SEH_EXCEPT { LogErr("ToughnessFeast: tip feast SEH"); }
+        }
+#else
+        (void)s_tipTick;
+#endif
+    }
 
     int active = 0, missing = 0;
     line("-- Limbs --", "4 slots");
