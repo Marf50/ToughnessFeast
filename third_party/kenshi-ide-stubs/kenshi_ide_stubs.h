@@ -134,3 +134,20 @@ public:
   PlayerInterface* player=nullptr;
 };
 static GameWorld* ou = nullptr;
+
+class TitleScreen {
+public:
+  TitleScreen* _CONSTRUCTOR(){return this;}
+};
+namespace MyGUI {
+class EditBox : public TextBox {
+public:
+  void setEditReadOnly(bool){}
+  void setEditMultiLine(bool){}
+  void setEditWordWrap(bool){}
+  void setVisible(bool){}
+  void setEnabled(bool){}
+  void setCaption(const char*){}
+};
+// augment Window
+}

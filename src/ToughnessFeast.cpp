@@ -31,9 +31,11 @@
 #include <kenshi/util/hand.h>
 #include <mygui/MyGUI_Gui.h>
 #include <mygui/MyGUI_Window.h>
+#include <kenshi/gui/TitleScreen.h>
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_EditBox.h>
 #include <mygui/MyGUI_Widget.h>
+#include <mygui/MyGUI_UString.h>
 #endif
 
 #include <cstdint>
@@ -226,6 +228,7 @@ static CharStats* g_lastStats = nullptr;
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
 static MyGUI::Window* g_hudWindow = nullptr;
 static MyGUI::TextBox* g_hudText = nullptr;
+static int g_hudIsEdit = 0;
 static int g_hudCreateAttempts = 0;
 #endif
 
@@ -403,71 +406,96 @@ static CharStats* TryGetSelectedStats()
 #endif
 }
 
-static void EnsureStatusHud()
+static void CreateStatusHudForced()
 {
 #if defined(TOUGHNESSFEAST_LINUX_IDE)
     return;
 #else
     if (!g_cfg.showStatusHud) return;
     if (g_hudWindow) return;
-    if (g_hudCreateAttempts > 40) return; // stop spamming
 
     MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
     if (!gui)
     {
-        ++g_hudCreateAttempts;
+        DebugLog("ToughnessFeast: MyGUI not ready yet");
         return;
     }
 
-    try
-    {
-        // Compact panel upper-right (real coords 0..1)
-        g_hudWindow = gui->createWidgetReal<MyGUI::Window>(
-            "Kenshi_WindowCX",
-            0.72f, 0.06f, 0.27f, 0.40f,
-            MyGUI::Align::Default,
-            "Main",
-            "ToughnessFeastHud");
-        if (!g_hudWindow)
-        {
-            ++g_hudCreateAttempts;
-            return;
-        }
-        g_hudWindow->setCaption("Toughness Feast");
-        g_hudWindow->setMinSize(180, 160);
+    // Match KillButton: layer "Window", skin Kenshi_WindowCX
+    g_hudWindow = gui->createWidgetReal<MyGUI::Window>(
+        "Kenshi_WindowCX",
+        0.70f, 0.08f, 0.28f, 0.42f,
+        MyGUI::Align::Default,
+        "Window",
+        "ToughnessFeastHud");
 
-        MyGUI::Widget* client = g_hudWindow->getClientWidget();
-        if (client)
-        {
-            g_hudText = client->createWidgetReal<MyGUI::TextBox>(
-                "Kenshi_TextBox",
-                0.02f, 0.02f, 0.96f, 0.96f,
-                MyGUI::Align::Stretch,
-                "TfHudText");
-            if (!g_hudText)
-            {
-                // fallback skin
-                g_hudText = client->createWidgetReal<MyGUI::TextBox>(
-                    "TextBox",
-                    0.02f, 0.02f, 0.96f, 0.96f,
-                    MyGUI::Align::Stretch,
-                    "TfHudText2");
-            }
-        }
+    if (!g_hudWindow)
+    {
+        ErrorLog("ToughnessFeast: failed to create HUD window");
+        return;
+    }
+
+    g_hudWindow->setCaption("Toughness Feast");
+    g_hudWindow->setVisible(true);
+    g_hudWindow->setEnabled(true);
+
+    MyGUI::Widget* client = g_hudWindow->getClientWidget();
+    if (!client)
+        client = g_hudWindow;
+
+    MyGUI::EditBox* edit = nullptr;
+    edit = client->createWidgetReal<MyGUI::EditBox>(
+        "EditBox",
+        0.03f, 0.03f, 0.94f, 0.94f,
+        MyGUI::Align::Stretch,
+        "TfHudEdit");
+
+    if (edit)
+    {
+        edit->setEditReadOnly(true);
+        edit->setEditMultiLine(true);
+        edit->setEditWordWrap(true);
+        edit->setVisible(true);
+        edit->setCaption(g_statusText);
+        g_hudText = reinterpret_cast<MyGUI::TextBox*>(edit);
+        g_hudIsEdit = 1;
+    }
+    else
+    {
+        g_hudText = client->createWidgetReal<MyGUI::TextBox>(
+            "TextBox",
+            0.03f, 0.03f, 0.94f, 0.94f,
+            MyGUI::Align::Stretch,
+            "TfHudText");
         if (g_hudText)
         {
+            g_hudText->setVisible(true);
             g_hudText->setCaption(g_statusText);
-            g_hudText->setTextAlign(MyGUI::Align::Left | MyGUI::Align::Top);
+            g_hudIsEdit = 0;
         }
-        DebugLog("ToughnessFeast: status HUD created");
     }
-    catch (...)
-    {
-        g_hudWindow = nullptr;
-        g_hudText = nullptr;
-        ++g_hudCreateAttempts;
-        ErrorLog("ToughnessFeast: status HUD create failed");
-    }
+
+    DebugLog("ToughnessFeast: status HUD window created");
+#endif
+}
+
+static void EnsureStatusHud()
+{
+    CreateStatusHudForced();
+}
+
+static void SetHudCaption(const char* text)
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    (void)text;
+#else
+    if (!text) return;
+    if (g_hudIsEdit && g_hudText)
+        reinterpret_cast<MyGUI::EditBox*>(g_hudText)->setCaption(text);
+    else if (g_hudText)
+        g_hudText->setCaption(text);
+    if (g_hudWindow)
+        g_hudWindow->setVisible(true);
 #endif
 }
 
@@ -481,19 +509,24 @@ static void RefreshStatusHud(CharStats* preferStats)
 
     BuildStatusText(stats);
     EnsureStatusHud();
+    SetHudCaption(g_statusText);
+}
 
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
-    if (g_hudText)
-    {
-        g_hudText->setCaption(g_statusText);
-    }
-    else if (g_hudWindow)
-    {
-        // last resort: put text in window caption (short)
-        g_hudWindow->setCaption("Toughness Feast (see log)");
-    }
-#endif
+static TitleScreen* (*TitleScreen_ctor_orig)(TitleScreen*) = nullptr;
+static TitleScreen* TitleScreen_ctor_hook(TitleScreen* self)
+{
+    TitleScreen* r = TitleScreen_ctor_orig ? TitleScreen_ctor_orig(self) : self;
+    DebugLog("ToughnessFeast: TitleScreen ctor — creating HUD");
+    std::snprintf(g_statusText, sizeof(g_statusText),
+        "=== Toughness Feast ===\n"
+        "Load a save / select a character\n"
+        "to see limb regrowth progress.\n");
+    CreateStatusHudForced();
+    SetHudCaption(g_statusText);
+    return r;
 }
+#endif
 
 // ---------- gameplay (only used if EnableHooks=1) ----------
 //
@@ -738,6 +771,11 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
     if (frameTime > 0.25f) frameTime = 0.25f;
 
     float power = RegenPowerFromStats(stats);
+
+    // Always refresh HUD (even with 0 power — shows unlock threshold)
+    g_lastStats = stats;
+    RefreshStatusHud(stats);
+
     if (power <= 0.f) return;
 
     MedicalSystem* med = stats->medical;
@@ -749,7 +787,11 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
     if (!me->amSomeoneWhoNeedsToEatToLive()) return;
 
     float hunger = med->hunger;
-    if (hunger < g_cfg.minHungerToRegen) return;
+    if (hunger < g_cfg.minHungerToRegen)
+    {
+        RefreshStatusHud(stats);
+        return;
+    }
     if (hunger < 0.f || hunger > 5.f) return;
 
     float fleshBudget = g_cfg.fleshHealPerSecond * power * frameTime;
@@ -864,6 +906,8 @@ static float calculateToughnessDamageResistanceMult_hook(CharStats* self)
     self->_toughness = saved;
     if (g_cfg.enableMedicalHooks)
         ApplyFoodRegenFromStats(self, 0.02f);
+    else if (g_cfg.showStatusHud)
+        RefreshStatusHud(self);
     return r;
 }
 
@@ -1043,6 +1087,19 @@ static void InstallHooks()
         DebugLog("ToughnessFeast: food regen + staged limb restore ON (no medicalUpdate hook)");
     else
         DebugLog("ToughnessFeast: food regen OFF (EnableMedicalHooks=0)");
+
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    if (g_cfg.showStatusHud)
+    {
+        // TitleScreen::_CONSTRUCTOR → TitleScreen* (this)
+        HookExport("?_CONSTRUCTOR@TitleScreen@@QEAAPEAV1@XZ",
+                   (void*)TitleScreen_ctor_hook,
+                   (void**)&TitleScreen_ctor_orig,
+                   "ToughnessFeast: hooked TitleScreen for HUD");
+        // Try create immediately if already in-game / GUI up
+        CreateStatusHudForced();
+    }
+#endif
 }
 
 #if defined(_MSC_VER)
