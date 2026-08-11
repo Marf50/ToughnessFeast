@@ -1,8 +1,8 @@
 // ToughnessFeast — RE_Kenshi plugin
 // Export: C++ mangled ?startPlugin@@YAXXZ (NOT extern "C")
 //
-// SAFETY: EnableHooks=0 by default. startPlugin only logs.
-// Set EnableHooks=1 in config.ini after the game opens cleanly.
+// EnableHooks=1 in config installs combat soft-cap + food limb regen.
+// Set EnableHooks=0 to load-only if diagnosing crashes.
 
 #if defined(TOUGHNESSFEAST_LINUX_IDE)
 #include "kenshi_ide_stubs.h"
@@ -69,7 +69,7 @@ static Config g_cfg = {
     2.5f, 1.5f, 0.012f, 0.10f,
     1, 3.0f, 0.85f, 0.18f,
     1, 1,
-    0  // EnableHooks DEFAULT OFF until proven stable
+    1  // EnableHooks default ON (load path verified)
 };
 
 static char g_pluginDir[MAX_PATH] = { 0 };
