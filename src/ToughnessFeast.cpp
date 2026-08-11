@@ -399,17 +399,19 @@ enum RaceKind { RACE_UNKNOWN=0, RACE_HUMAN, RACE_SHEK, RACE_HIVER, RACE_ROBOT };
 static CharStats* StatsFromMedical(MedicalSystem* med)
 {
     if (!med) return nullptr;
-    // Game offsets: me @ 0xE0 (Character*)
+    // Game offsets: stats @ 0x1A8, me @ 0xE0
+    CharStats* st = nullptr;
+    std::memcpy(&st, (const char*)(void*)med + 0x1A8, sizeof(st));
+    if (st && (uintptr_t)st > 0x10000ull) return st;
+
     Character* me = nullptr;
     std::memcpy(&me, (const char*)(void*)med + 0xE0, sizeof(me));
     if (!me || (uintptr_t)me < 0x10000ull) return nullptr;
-    CharStats* st = nullptr;
     TF_SEH_TRY { st = me->getStats(); }
     TF_SEH_EXCEPT { st = nullptr; }
-    if (st) return st;
-    // CharStats often at Character path — also try medical field if present
-    return nullptr;
+    return st;
 }
+
 
 static Character* CharFromStats(CharStats* stats)
 {
@@ -614,63 +616,54 @@ static MedicalSystem::HealthPartStatus* ResolveLimb(MedicalSystem* med, int slot
 static LimbState ReadLimbState(MedicalSystem* med, int slot);
 
 
-// Find RobotLimbs* on MedicalSystem without trusting compiler offsets.
-// Game comment says 0xC8; boost-map padding can make field access wrong.
-// Scan for a block whose character* matches our Character.
+// RobotLimbs* at MedicalSystem+0xC8 (game layout). NEVER scan blindly —
+// too many Character*-leading objects; wrong `this` makes setLimb no-op
+// (log: afterState stays STUMP=1 forever).
 static RobotLimbs* GetRobotLimbs(MedicalSystem* med)
 {
     if (!med) return nullptr;
-    Character* me = med->me;
-    if (!me && med->stats) me = med->stats->me;
 
-    // Try documented offset first
+    Character* me = nullptr;
+    std::memcpy(&me, (const char*)(void*)med + 0xE0, sizeof(me));
+    if (!me || (uintptr_t)me < 0x10000ull) return nullptr;
+
+    RobotLimbs* r = nullptr;
+    std::memcpy(&r, (const char*)(void*)med + 0xC8, sizeof(r));
+    if (!r || (uintptr_t)r < 0x10000ull) return nullptr;
+
+    Character* owner = nullptr;
+    TF_SEH_TRY { std::memcpy(&owner, (const char*)(void*)r + 0x0, sizeof(owner)); }
+    TF_SEH_EXCEPT { return nullptr; }
+    if (owner != me) return nullptr;
+
+    // states[4] @ +0x10 must be LimbState 0..3
+    TF_SEH_TRY
     {
-        RobotLimbs* r = nullptr;
-        std::memcpy(&r, (const char*)(void*)med + 0xC8, sizeof(r));
-        if (r && (uintptr_t)r > 0x10000ull)
+        for (int i = 0; i < 4; ++i)
         {
-            if (!me) return r;
-            Character* owner = nullptr;
-            std::memcpy(&owner, (const char*)(void*)r + 0x0, sizeof(owner));
-            if (owner == me) return r;
+            unsigned s = 99;
+            std::memcpy(&s, (const char*)(void*)r + 0x10 + (size_t)i * 4, sizeof(unsigned));
+            if (s > 3u) return nullptr;
         }
     }
+    TF_SEH_EXCEPT { return nullptr; }
 
-    // Scan nearby pointer slots for RobotLimbs { Character* at 0 }
-    if (me)
-    {
-        for (size_t off = 0x40; off <= 0x1F0; off += sizeof(void*))
-        {
-            RobotLimbs* r = nullptr;
-            std::memcpy(&r, (const char*)(void*)med + off, sizeof(r));
-            if (!r || (uintptr_t)r < 0x10000ull) continue;
-            // reject obvious non-heap (very high or low)
-            Character* owner = nullptr;
-            TF_SEH_TRY
-            {
-                std::memcpy(&owner, (const char*)(void*)r + 0x0, sizeof(owner));
-            }
-            TF_SEH_EXCEPT { continue; }
-            if (owner == me)
-            {
-                if (g_cfg.debugLog)
-                {
-                    static size_t s_off = 0;
-                    if (s_off != off)
-                    {
-                        s_off = off;
-                        char msg[80];
-                        std::snprintf(msg, sizeof(msg),
-                            "ToughnessFeast: robotLimbs @ MedicalSystem+0x%X", (unsigned)off);
-                        Log(msg);
-                    }
-                }
-                return r;
-            }
-        }
-    }
-    return nullptr;
+    return r;
 }
+
+static int IsPlayerSide(Character* me)
+{
+    if (!me) return 0;
+    int ok = 0;
+    TF_SEH_TRY
+    {
+        if (me->isPlayerCharacter()) ok = 1;
+        else if (me->isWithThePlayer()) ok = 1;
+    }
+    TF_SEH_EXCEPT { ok = 0; }
+    return ok;
+}
+
 
 // Resolve game setLimb — direct C++ call may not land in kenshi.exe
 typedef void (*Game_SetLimbFn)(RobotLimbs* self, int limb, int state, void* item);
@@ -749,78 +742,111 @@ static int ForceRestoreOrganicLimb(MedicalSystem* med, int slot)
     };
     RobotLimbs::Limb limb = kEnum[slot];
     RobotLimbs* robots = GetRobotLimbs(med);
-    int called = 0;
 
-    if (g_cfg.debugLog)
+    if (!robots)
     {
-        char msg[120];
-        std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: ForceRestore begin slot %d robots=%p",
-            slot, (void*)robots);
-        Log(msg);
-    }
-
-    // Call real setLimb FIRST — do NOT raw-write ORIGINAL (that desynced state and
-    // blocked later stump formation after a "fake" restore).
-    TF_SEH_TRY
-    {
-        if (robots && g_setLimb)
-        {
-            g_setLimb(robots, (int)limb, (int)LIMB_ORIGINAL, nullptr);
-            called = 1;
-        }
-        else if (robots)
-        {
-            robots->setLimb(limb, LIMB_ORIGINAL, nullptr);
-            called = 1;
-        }
-
-        if (g_setRobotLimbItem)
-        {
-            g_setRobotLimbItem(med, (int)limb, nullptr, false);
-            called = 1;
-        }
-    }
-    TF_SEH_EXCEPT
-    {
-        LogErr("ToughnessFeast: ForceRestoreOrganicLimb SEH");
+        if (g_cfg.debugLog)
+            Log("ToughnessFeast: ForceRestore aborted — invalid robotLimbs @0xC8");
         return 0;
     }
 
-    LimbState after = ReadLimbState(med, slot);
-
-    // Only touch flesh if game actually accepted ORIGINAL
-    if (after == LIMB_ORIGINAL)
+    if (g_cfg.debugLog)
     {
-        MedicalSystem::HealthPartStatus* part = ResolveLimb(med, slot);
-        if (part)
+        char msg[140];
+        std::snprintf(msg, sizeof(msg),
+            "ToughnessFeast: ForceRestore slot %d robots=%p setLimb=%p",
+            slot, (void*)robots, (void*)g_setLimb);
+        Log(msg);
+    }
+
+    TF_SEH_TRY
+    {
+        // 1) Game setLimb(ORIGINAL)
+        if (g_setLimb)
+            g_setLimb(robots, (int)limb, (int)LIMB_ORIGINAL, nullptr);
+        else
+            robots->setLimb(limb, LIMB_ORIGINAL, nullptr);
+
+        // 2) Direct state table on VALIDATED robots (this is what getState reads)
+        LimbState* states = (LimbState*)((char*)(void*)robots + 0x10);
+        void** items = (void**)((char*)(void*)robots + 0x20);
+        states[(int)limb] = LIMB_ORIGINAL;
+        items[(int)limb] = nullptr;
+
+        // 3) setRobotLimbItem(null) rebuild path
+        if (g_setRobotLimbItem)
+            g_setRobotLimbItem(med, (int)limb, nullptr, true);
+
+        // 4) Arm OK flags on MedicalSystem (game: right 0x165, left 0x166)
+        if (slot == 0)
         {
-            TF_SEH_TRY
-            {
-                float maxHp = PartMaxHp(part);
-                float start = maxHp * g_cfg.limbRestoredStart;
-                if (start < 1.f) start = maxHp * 0.18f;
-                part->flesh = start;
-                if (part->fleshStun < maxHp * 0.4f)
-                    part->fleshStun = maxHp * 0.4f;
-                part->updateDerivedHealths();
-            }
-            TF_SEH_EXCEPT { }
+            unsigned char one = 1;
+            std::memcpy((char*)(void*)med + 0x166, &one, 1); // leftArmOk
         }
-        TF_SEH_TRY { med->updateStats(); }
+        else if (slot == 1)
+        {
+            unsigned char one = 1;
+            std::memcpy((char*)(void*)med + 0x165, &one, 1); // rightArmOk
+        }
+
+        // 5) Re-assert state table (setRobotLimbItem may clobber)
+        states[(int)limb] = LIMB_ORIGINAL;
+        items[(int)limb] = nullptr;
+    }
+    TF_SEH_EXCEPT
+    {
+        LogErr("ToughnessFeast: ForceRestore SEH");
+        return 0;
+    }
+
+    // Flesh only if state stuck or became ORIGINAL
+    MedicalSystem::HealthPartStatus* part = ResolveLimb(med, slot);
+    if (part)
+    {
+        TF_SEH_TRY
+        {
+            float maxHp = PartMaxHp(part);
+            float start = maxHp * g_cfg.limbRestoredStart;
+            if (start < 1.f) start = maxHp * 0.18f;
+            if (part->flesh < start) part->flesh = start;
+            if (part->fleshStun < maxHp * 0.35f)
+                part->fleshStun = maxHp * 0.35f;
+            part->updateDerivedHealths();
+        }
         TF_SEH_EXCEPT { }
     }
 
+    TF_SEH_TRY { med->updateStats(); }
+    TF_SEH_EXCEPT { }
+    TF_SEH_TRY { med->validateHealthValues(); }
+    TF_SEH_EXCEPT { }
+
+    // Prefer raw table read (we control it) then getLimbState
+    LimbState table = LIMB_STUMP;
+    TF_SEH_TRY
+    {
+        LimbState* states = (LimbState*)((char*)(void*)robots + 0x10);
+        table = states[(int)limb];
+    }
+    TF_SEH_EXCEPT { }
+
+    LimbState after = ReadLimbState(med, slot);
+
     if (g_cfg.debugLog)
     {
-        char msg[128];
+        char msg[160];
         std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: ForceRestore end slot %d afterState=%d called=%d",
-            slot, (int)after, called);
+            "ToughnessFeast: ForceRestore end slot %d table=%d read=%d",
+            slot, (int)table, (int)after);
         Log(msg);
     }
+
+    // Success if table is ORIGINAL (even if ReadLimbState still confuses flesh flags)
+    if (table == LIMB_ORIGINAL)
+        return 1;
     return (after == LIMB_ORIGINAL) ? 1 : 0;
 }
+
 
 
 
@@ -834,14 +860,24 @@ static int ForceFormStump(MedicalSystem* med, int slot)
     };
     RobotLimbs::Limb limb = kEnum[slot];
     RobotLimbs* robots = GetRobotLimbs(med);
+    if (!robots)
+    {
+        if (g_cfg.debugLog)
+            Log("ToughnessFeast: ForceFormStump aborted — invalid robotLimbs");
+        return 0;
+    }
 
     TF_SEH_TRY
     {
-        if (robots && g_setLimb)
+        if (g_setLimb)
             g_setLimb(robots, (int)limb, (int)LIMB_STUMP, nullptr);
-        else if (robots)
+        else
             robots->setLimb(limb, LIMB_STUMP, nullptr);
-        // Do not raw-write state table — desyncs getLimbState
+
+        LimbState* states = (LimbState*)((char*)(void*)robots + 0x10);
+        void** items = (void**)((char*)(void*)robots + 0x20);
+        states[(int)limb] = LIMB_STUMP;
+        items[(int)limb] = nullptr;
     }
     TF_SEH_EXCEPT
     {
@@ -849,18 +885,16 @@ static int ForceFormStump(MedicalSystem* med, int slot)
         return 0;
     }
 
-    LimbState after = ReadLimbState(med, slot);
     MedicalSystem::HealthPartStatus* part = ResolveLimb(med, slot);
-    if (part && (after == LIMB_STUMP || after == LIMB_CRUSHED))
+    if (part)
     {
         TF_SEH_TRY
         {
             float maxHp = PartMaxHp(part);
-            // Keep a small positive nub for budding; if deeply negative, lift toward 0 first
             float flesh = part->flesh;
             if (flesh != flesh) flesh = 0.f;
             if (flesh < 0.f)
-                part->flesh = flesh * 0.5f; // heal half the overdamage as stump forms
+                part->flesh = flesh * 0.25f; // climb toward 0
             else
             {
                 float nub = maxHp * 0.05f;
@@ -872,15 +906,24 @@ static int ForceFormStump(MedicalSystem* med, int slot)
         TF_SEH_EXCEPT { }
     }
 
+    LimbState table = LIMB_CRUSHED;
+    TF_SEH_TRY
+    {
+        LimbState* states = (LimbState*)((char*)(void*)robots + 0x10);
+        table = states[(int)limb];
+    }
+    TF_SEH_EXCEPT { }
+
     if (g_cfg.debugLog)
     {
         char msg[96];
         std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: ForceFormStump slot %d afterState=%d", slot, (int)after);
+            "ToughnessFeast: ForceFormStump slot %d table=%d", slot, (int)table);
         Log(msg);
     }
-    return (after == LIMB_STUMP || after == LIMB_CRUSHED) ? 1 : 0;
+    return (table == LIMB_STUMP) ? 1 : 0;
 }
+
 
 
 
@@ -963,27 +1006,13 @@ static LimbState ReadLimbState(MedicalSystem* med, int slot)
         TF_SEH_EXCEPT { }
     }
 
-    // 4) Functional missing: negative flesh / limb-ok flags even if state says ORIGINAL
-    //    (happens after a partial restore that wrote ORIGINAL into the table)
-    if (st == LIMB_ORIGINAL)
+    // 4) Functional missing: negative flesh (HUD -45 style) overrides ORIGINAL
+    if (st == LIMB_ORIGINAL && part)
     {
-        int missing = 0;
-        if (part)
-        {
-            float flesh = 0.f;
-            TF_SEH_TRY { flesh = part->flesh; }
-            TF_SEH_EXCEPT { flesh = 0.f; }
-            if (flesh == flesh && flesh < -0.5f)
-                missing = 1; // severed / overdamage like HUD -45
-        }
-        TF_SEH_TRY
-        {
-            if (slot == 0 && !med->isLeftArmOk()) missing = 1;
-            if (slot == 1 && !med->isRightArmOk()) missing = 1;
-            // Legs: if both legs bad, canIkick is false — still check flesh
-        }
-        TF_SEH_EXCEPT { }
-        if (missing)
+        float flesh = 0.f;
+        TF_SEH_TRY { flesh = part->flesh; }
+        TF_SEH_EXCEPT { flesh = 0.f; }
+        if (flesh == flesh && flesh < -0.5f)
             st = LIMB_CRUSHED;
     }
 
@@ -1238,6 +1267,12 @@ static void DriveFeastFromMedical(MedicalSystem* med, float dt)
 
     CharStats* stats = StatsFromMedical(med);
     if (!stats) return;
+
+    // Only player / player squad — medicalUpdate runs for every character
+    Character* me = nullptr;
+    std::memcpy(&me, (const char*)(void*)med + 0xE0, sizeof(me));
+    if (!IsPlayerSide(me)) return;
+
     ApplyFeastTick(stats, useDt);
 }
 
