@@ -7,6 +7,12 @@
 #if defined(TOUGHNESSFEAST_LINUX_IDE)
 #include "kenshi_ide_stubs.h"
 #else
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX

@@ -76,6 +76,8 @@ if(_GAME_BUILD)
   target_compile_definitions(ToughnessFeast PRIVATE
     _WINDOWS
     _USRDLL
+    UNICODE
+    _UNICODE
     NOMINMAX
     WIN32_LEAN_AND_MEAN
     $<$<CONFIG:Release>:NDEBUG>
