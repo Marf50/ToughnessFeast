@@ -1,6 +1,4 @@
 // Minimal stand-ins for KenshiLib types — used only when TOUGHNESSFEAST_LINUX_IDE=1
-// so CLion on Linux can parse / index the plugin without Windows SDK, Boost, Ogre.
-// Real MSVC builds include the real KenshiLib headers instead.
 #pragma once
 
 #include <cstdint>
@@ -10,7 +8,6 @@
 #define MAX_PATH 260
 #endif
 
-// ---- Win32 bits used by ResolvePluginDir ------------------------------------
 using DWORD = unsigned long;
 using HMODULE = void*;
 using LPCSTR = const char*;
@@ -35,13 +32,11 @@ inline DWORD GetModuleFileNameA(HMODULE, LPSTR buf, DWORD size)
     return 0;
 }
 
-// ---- Debug ------------------------------------------------------------------
 inline void DebugLog(const char*) {}
 inline void DebugLog(const std::string&) {}
 inline void ErrorLog(const char*) {}
 inline void ErrorLog(const std::string&) {}
 
-// ---- Enums ------------------------------------------------------------------
 enum StatsEnumerated
 {
     STAT_TOUGHNESS = 0
@@ -55,12 +50,12 @@ enum LimbState
     LIMB_CRUSHED = 3
 };
 
-// ---- Forward game types -----------------------------------------------------
 class Character;
 class CharStats;
 class MedicalSystem;
 class GameData;
 class RaceData;
+class Item;
 
 class GameData
 {
@@ -93,6 +88,20 @@ public:
     void xpStat_timeBased(StatsEnumerated) {}
 };
 
+class RobotLimbs
+{
+public:
+    enum Limb
+    {
+        LEFT_ARM,
+        RIGHT_ARM,
+        LEFT_LEG,
+        RIGHT_LEG,
+        NULL_LIMB
+    };
+    void setLimb(Limb, LimbState, Item*) {}
+};
+
 class MedicalSystem
 {
 public:
@@ -107,25 +116,33 @@ public:
         };
         float flesh = 0.f;
         float fleshStun = 0.f;
+        float _maxHealth = 100.f;
         PartType whatAmI = PART_TORSO;
         bool isRobotic() const { return false; }
         bool isDead() const { return false; }
-        float maxHealth() const { return 100.f; }
+        float maxHealth() const { return _maxHealth; }
         LimbState getRobotLimbState() const { return LIMB_ORIGINAL; }
+        RobotLimbs::Limb getRobotLimbEnum() const { return RobotLimbs::NULL_LIMB; }
         void updateDerivedHealths() {}
     };
 
     bool dead = false;
     float hunger = 1.f;
+    float fed = 1.f;
     CharStats* stats = nullptr;
     Character* me = nullptr;
+    HealthPartStatus* leftArm = nullptr;
+    HealthPartStatus* rightArm = nullptr;
+    HealthPartStatus* leftLeg = nullptr;
+    HealthPartStatus* rightLeg = nullptr;
+    RobotLimbs* robotLimbs = nullptr;
 
+    bool isFed() const { return fed > 0.5f; }
     int getPartCount() const { return 0; }
     HealthPartStatus* getPart(unsigned long long) { return nullptr; }
     void medicalUpdate(float) {}
 };
 
-// ---- KenshiLib hook API (mirrors core/Functions.h) --------------------------
 namespace KenshiLib
 {
 enum HookStatus
@@ -155,9 +172,8 @@ inline HookStatus AddHook(T1* target, void* detour, T2** original)
 {
     return AddHook(static_cast<void*>(target), detour, reinterpret_cast<void**>(original));
 }
-} // namespace KenshiLib
+}
 
-// MSVC-only bits
 #ifndef _TRUNCATE
 #define _TRUNCATE ((size_t)-1)
 #endif

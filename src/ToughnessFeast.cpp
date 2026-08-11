@@ -71,6 +71,7 @@ struct Config
     float minHungerToRegen;
     bool healUnhealable;
     float limbRegrowPerSecond;
+    float limbRestoreFleshPct; // stump/crush restores to LIMB_ORIGINAL at this flesh%
     float past100XpMult;
     bool debugLog;
 };
@@ -82,13 +83,14 @@ static Config g_cfg = {
     0.f,    // foodRegenStartHiver
     75.f,   // foodRegenStartOther
     0.04f,  // foodRegenScalePerPoint
-    0.012f, // foodRegenScaleHiver (T=25 -> 0.3, T=83 -> 1.0)
+    0.012f, // foodRegenScaleHiver
     2.5f,   // fleshHealPerSecond
     1.5f,   // stunHealPerSecond
     0.012f, // hungerDrainPerSecond
-    0.15f,  // minHungerToRegen
+    0.10f,  // minHungerToRegen (slightly more permissive)
     true,   // healUnhealable
-    0.15f,  // limbRegrowPerSecond
+    3.0f,   // limbRegrowPerSecond — noticeable stump flesh rebuild
+    0.85f,  // limbRestoreFleshPct
     0.18f,  // past100XpMult
     false   // debugLog
 };
@@ -158,6 +160,7 @@ static void LoadConfig()
         else if (key == "MinHungerToRegen") g_cfg.minHungerToRegen = (float)std::atof(val.c_str());
         else if (key == "HealUnhealableWounds") g_cfg.healUnhealable = ParseBool(val);
         else if (key == "LimbRegrowPerSecond") g_cfg.limbRegrowPerSecond = (float)std::atof(val.c_str());
+        else if (key == "LimbRestoreFleshPercent") g_cfg.limbRestoreFleshPct = (float)std::atof(val.c_str());
         else if (key == "Past100XpMult") g_cfg.past100XpMult = (float)std::atof(val.c_str());
         else if (key == "DebugLog") g_cfg.debugLog = ParseBool(val);
     }
@@ -356,7 +359,8 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
     if (power <= 0.f) return;
     if (power > 4.f) power = 4.f;
 
-    if (med->hunger < g_cfg.minHungerToRegen)
+    // Prefer medical hunger; fall back to fed flag if hunger is weird
+    if (med->hunger < g_cfg.minHungerToRegen && !med->isFed())
         return;
 
     float fleshBudget = g_cfg.fleshHealPerSecond * power * frameTime;
@@ -365,6 +369,82 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
     float hungerCost = 0.f;
     bool anyHeal = false;
 
+    // --- 1) Stump / crushed limb regrowth (MUST run even if part->isDead()) ---
+    // Previous builds skipped isDead() parts, so lost limbs never healed.
+    if (limbBudget > 0.f && g_cfg.limbRegrowPerSecond > 0.f)
+    {
+        MedicalSystem::HealthPartStatus* limbs[4] = {
+            med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
+        };
+        for (int li = 0; li < 4; ++li)
+        {
+            MedicalSystem::HealthPartStatus* part = limbs[li];
+            if (!part) continue;
+            if (part->isRobotic()) continue;
+
+            LimbState ls = part->getRobotLimbState();
+            // Prosthetic — leave alone
+            if (ls == LIMB_REPLACED) continue;
+
+            bool missing = (ls == LIMB_STUMP || ls == LIMB_CRUSHED);
+            // Also treat near-zero flesh arm/leg as ruined organic
+            float maxHp = part->maxHealth();
+            if (maxHp <= 1.f) maxHp = part->_maxHealth;
+            if (maxHp <= 1.f) maxHp = 100.f;
+
+            if (!missing && part->flesh > maxHp * 0.05f)
+                continue; // healthy enough for normal flesh pass
+
+            // Rebuild stump flesh toward max
+            if (part->flesh < maxHp && limbBudget > 0.f)
+            {
+                // Start crushed/stump HP at least at 0 so we can climb
+                if (part->flesh < 0.f)
+                    part->flesh = 0.f;
+
+                float need = maxHp - part->flesh;
+                float take = (need < limbBudget) ? need : limbBudget;
+                // Crushed regrows a bit slower than stump tissue
+                if (ls == LIMB_CRUSHED)
+                    take *= 0.75f;
+                part->flesh += take;
+                limbBudget -= take;
+                hungerCost += take * 0.8f;
+                anyHeal = true;
+            }
+
+            // Restore functional limb once flesh is high enough
+            float restoreAt = maxHp * g_cfg.limbRestoreFleshPct;
+            if (restoreAt < 1.f) restoreAt = maxHp * 0.85f;
+
+            if (missing && part->flesh >= restoreAt && med->robotLimbs)
+            {
+                RobotLimbs::Limb limbEnum = part->getRobotLimbEnum();
+                if (limbEnum != RobotLimbs::NULL_LIMB)
+                {
+                    med->robotLimbs->setLimb(limbEnum, LIMB_ORIGINAL, nullptr);
+                    // Clear "dead limb" residual damage so the part is usable
+                    if (part->flesh < maxHp * 0.9f)
+                        part->flesh = maxHp * 0.9f;
+                    part->fleshStun = 0.f;
+                    part->updateDerivedHealths();
+                    anyHeal = true;
+
+                    char msg[192];
+                    std::snprintf(msg, sizeof(msg),
+                        "ToughnessFeast: restored limb (state was %d) flesh=%.1f/%.1f t=%.1f p=%.2f",
+                        (int)ls, part->flesh, maxHp, tough, power);
+                    DebugLog(msg);
+                }
+            }
+            else
+            {
+                part->updateDerivedHealths();
+            }
+        }
+    }
+
+    // --- 2) Normal flesh / overdamage / stun heal (skip truly dead non-limb parts) ---
     int count = med->getPartCount();
     for (int pass = 0; pass < 2; ++pass)
     {
@@ -373,7 +453,16 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
             MedicalSystem::HealthPartStatus* part = med->getPart((unsigned long long)i);
             if (!part) continue;
             if (part->isRobotic()) continue;
-            if (part->isDead()) continue;
+
+            LimbState ls = part->getRobotLimbState();
+            bool isLimbPart =
+                part->whatAmI == MedicalSystem::HealthPartStatus::PART_ARM
+                || part->whatAmI == MedicalSystem::HealthPartStatus::PART_LEG;
+            bool missing = (ls == LIMB_STUMP || ls == LIMB_CRUSHED);
+
+            // Dead torso/head = ignore. Dead stump already handled above.
+            if (part->isDead() && !missing) continue;
+            if (missing) continue; // already handled in limb pass
 
             float maxHp = part->maxHealth();
             if (maxHp <= 0.f) continue;
@@ -404,24 +493,8 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
                 anyHeal = true;
             }
 
-            // Slow organic recovery on ruined limbs (not full magic regrowth)
-            if (limbBudget > 0.f
-                && part->whatAmI != MedicalSystem::HealthPartStatus::PART_TORSO
-                && part->whatAmI != MedicalSystem::HealthPartStatus::PART_HEAD)
-            {
-                LimbState ls = part->getRobotLimbState();
-                bool ruined = (ls == LIMB_CRUSHED || ls == LIMB_STUMP || part->flesh < maxHp * 0.05f);
-                if (ruined && part->flesh < maxHp * 0.25f)
-                {
-                    float take = (limbBudget < maxHp * 0.02f) ? limbBudget : (maxHp * 0.02f);
-                    part->flesh += take;
-                    limbBudget -= take;
-                    hungerCost += take * 1.2f;
-                    anyHeal = true;
-                }
-            }
-
             part->updateDerivedHealths();
+            (void)isLimbPart;
         }
     }
 
