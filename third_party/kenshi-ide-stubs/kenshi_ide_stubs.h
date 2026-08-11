@@ -59,12 +59,28 @@ enum LimbState
 class Character;
 class CharStats;
 class MedicalSystem;
+class GameData;
+class RaceData;
+
+class GameData
+{
+public:
+    std::string name;
+    std::string stringID;
+};
+
+class RaceData
+{
+public:
+    GameData* data = nullptr;
+};
 
 class Character
 {
 public:
     bool amSomeoneWhoNeedsToEatToLive() { return true; }
     bool isPlayerCharacter() const { return true; }
+    RaceData* getRace() const { return nullptr; }
 };
 
 class CharStats

@@ -21,6 +21,8 @@
 #include <kenshi/Character.h>
 #include <kenshi/MedicalSystem.h>
 #include <kenshi/Enums.h>
+#include <kenshi/RaceData.h>
+#include <kenshi/GameData.h>
 #endif
 
 #include <algorithm>
@@ -56,8 +58,13 @@ static int tf_strncpy_s(char* dest, size_t destsz, const char* src, size_t)
 struct Config
 {
     float combatCapToughness;
-    float foodRegenStart;
+    // Race-based food-regen unlock thresholds (toughness)
+    float foodRegenStartHuman;   // default 75
+    float foodRegenStartShek;    // default 50
+    float foodRegenStartHiver;   // default 0 — slight regen from the start
+    float foodRegenStartOther;   // default 75 (scorchlanders, etc.)
     float foodRegenScalePerPoint;
+    float foodRegenScaleHiver;   // gentler curve so early hiver regen stays slight
     float fleshHealPerSecond;
     float stunHealPerSecond;
     float hungerDrainPerSecond;
@@ -66,15 +73,16 @@ struct Config
     float limbRegrowPerSecond;
     float past100XpMult;
     bool debugLog;
-    // Test start: floor player toughness so food-regen is immediately usable
-    bool enableTestStart;
-    float testStartToughness;
 };
 
 static Config g_cfg = {
     100.f,  // combatCapToughness
-    75.f,   // foodRegenStart
+    75.f,   // foodRegenStartHuman
+    50.f,   // foodRegenStartShek
+    0.f,    // foodRegenStartHiver
+    75.f,   // foodRegenStartOther
     0.04f,  // foodRegenScalePerPoint
+    0.012f, // foodRegenScaleHiver (T=25 -> 0.3, T=83 -> 1.0)
     2.5f,   // fleshHealPerSecond
     1.5f,   // stunHealPerSecond
     0.012f, // hungerDrainPerSecond
@@ -82,9 +90,7 @@ static Config g_cfg = {
     true,   // healUnhealable
     0.15f,  // limbRegrowPerSecond
     0.18f,  // past100XpMult
-    false,  // debugLog
-    true,   // enableTestStart (ON for easy testing — set 0 in config.ini to disable)
-    75.f    // testStartToughness
+    false   // debugLog
 };
 
 static std::string Trim(const std::string& s)
@@ -134,8 +140,18 @@ static void LoadConfig()
         std::string key = Trim(line.substr(0, eq));
         std::string val = Trim(line.substr(eq + 1));
         if (key == "CombatCapToughness") g_cfg.combatCapToughness = (float)std::atof(val.c_str());
-        else if (key == "FoodRegenStartToughness") g_cfg.foodRegenStart = (float)std::atof(val.c_str());
+        // Legacy single-threshold key applies to human/other baseline
+        else if (key == "FoodRegenStartToughness") {
+            float v = (float)std::atof(val.c_str());
+            g_cfg.foodRegenStartHuman = v;
+            g_cfg.foodRegenStartOther = v;
+        }
+        else if (key == "FoodRegenStartHuman") g_cfg.foodRegenStartHuman = (float)std::atof(val.c_str());
+        else if (key == "FoodRegenStartShek") g_cfg.foodRegenStartShek = (float)std::atof(val.c_str());
+        else if (key == "FoodRegenStartHiver") g_cfg.foodRegenStartHiver = (float)std::atof(val.c_str());
+        else if (key == "FoodRegenStartOther") g_cfg.foodRegenStartOther = (float)std::atof(val.c_str());
         else if (key == "FoodRegenScalePerPoint") g_cfg.foodRegenScalePerPoint = (float)std::atof(val.c_str());
+        else if (key == "FoodRegenScaleHiver") g_cfg.foodRegenScaleHiver = (float)std::atof(val.c_str());
         else if (key == "FleshHealPerSecond") g_cfg.fleshHealPerSecond = (float)std::atof(val.c_str());
         else if (key == "StunHealPerSecond") g_cfg.stunHealPerSecond = (float)std::atof(val.c_str());
         else if (key == "HungerDrainPerSecond") g_cfg.hungerDrainPerSecond = (float)std::atof(val.c_str());
@@ -144,27 +160,84 @@ static void LoadConfig()
         else if (key == "LimbRegrowPerSecond") g_cfg.limbRegrowPerSecond = (float)std::atof(val.c_str());
         else if (key == "Past100XpMult") g_cfg.past100XpMult = (float)std::atof(val.c_str());
         else if (key == "DebugLog") g_cfg.debugLog = ParseBool(val);
-        else if (key == "EnableTestStart") g_cfg.enableTestStart = ParseBool(val);
-        else if (key == "TestStartToughness") g_cfg.testStartToughness = (float)std::atof(val.c_str());
     }
 
     char msg[320];
     std::snprintf(msg, sizeof(msg),
-        "ToughnessFeast: config loaded (cap=%.0f regenStart=%.0f testStart=%s@%.0f)",
-        g_cfg.combatCapToughness, g_cfg.foodRegenStart,
-        g_cfg.enableTestStart ? "ON" : "off", g_cfg.testStartToughness);
+        "ToughnessFeast: config (cap=%.0f starts H=%.0f S=%.0f V=%.0f O=%.0f)",
+        g_cfg.combatCapToughness,
+        g_cfg.foodRegenStartHuman, g_cfg.foodRegenStartShek,
+        g_cfg.foodRegenStartHiver, g_cfg.foodRegenStartOther);
     DebugLog(msg);
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers — race detection + food regen power
 // ---------------------------------------------------------------------------
 
-static float RegenPower(float toughness)
+static std::string ToLowerCopy(std::string s)
 {
-    float excess = toughness - g_cfg.foodRegenStart;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') s[i] = (char)(c - 'A' + 'a');
+    }
+    return s;
+}
+
+// Classify by race name / stringID (Hive*, Shek*, else human/other)
+enum RaceKind { RACE_HUMAN, RACE_SHEK, RACE_HIVER, RACE_OTHER };
+
+static RaceKind ClassifyRace(Character* me)
+{
+    if (!me) return RACE_OTHER;
+    RaceData* race = me->getRace();
+    if (!race || !race->data) return RACE_OTHER;
+
+    std::string blob = ToLowerCopy(race->data->name);
+    blob += " ";
+    blob += ToLowerCopy(race->data->stringID);
+
+    // Hivers: "Hive Worker", "Hive Soldier", "Southern Hive", "Hiver", etc.
+    if (blob.find("hive") != std::string::npos || blob.find("hiver") != std::string::npos)
+        return RACE_HIVER;
+    // Shek
+    if (blob.find("shek") != std::string::npos)
+        return RACE_SHEK;
+    // Greenlanders / Scorchlanders / default playable humans
+    if (blob.find("greenlander") != std::string::npos
+        || blob.find("scorchlander") != std::string::npos
+        || blob.find("human") != std::string::npos)
+        return RACE_HUMAN;
+
+    return RACE_OTHER;
+}
+
+static float FoodRegenStartFor(Character* me)
+{
+    switch (ClassifyRace(me))
+    {
+    case RACE_HIVER: return g_cfg.foodRegenStartHiver;
+    case RACE_SHEK:  return g_cfg.foodRegenStartShek;
+    case RACE_HUMAN: return g_cfg.foodRegenStartHuman;
+    default:         return g_cfg.foodRegenStartOther;
+    }
+}
+
+static float FoodRegenScaleFor(Character* me)
+{
+    if (ClassifyRace(me) == RACE_HIVER)
+        return g_cfg.foodRegenScaleHiver;
+    return g_cfg.foodRegenScalePerPoint;
+}
+
+static float RegenPower(Character* me, float toughness)
+{
+    float start = FoodRegenStartFor(me);
+    float scale = FoodRegenScaleFor(me);
+    float excess = toughness - start;
     if (excess <= 0.f) return 0.f;
-    return excess * g_cfg.foodRegenScalePerPoint;
+    return excess * scale;
 }
 
 // Temporarily clamp _toughness for vanilla combat formula functions
@@ -262,37 +335,6 @@ static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
 }
 
 // ---------------------------------------------------------------------------
-// Test start: floor player toughness so regen unlocks immediately
-// ---------------------------------------------------------------------------
-
-static void ApplyTestStartToughness(MedicalSystem* med)
-{
-    if (!g_cfg.enableTestStart) return;
-    if (g_cfg.testStartToughness <= 0.f) return;
-    if (!med || med->dead) return;
-
-    CharStats* stats = med->stats;
-    Character* me = med->me;
-    if (!stats || !me) return;
-    if (!me->isPlayerCharacter()) return;
-
-    // Only raise — never lower a character already above the test floor
-    if (stats->_toughness + 0.01f < g_cfg.testStartToughness)
-    {
-        float before = stats->_toughness;
-        stats->_toughness = g_cfg.testStartToughness;
-        if (g_cfg.debugLog)
-        {
-            char msg[160];
-            std::snprintf(msg, sizeof(msg),
-                "ToughnessFeast: test start toughness %.1f -> %.1f",
-                before, stats->_toughness);
-            DebugLog(msg);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Food-powered regeneration (post medicalUpdate)
 // ---------------------------------------------------------------------------
 
@@ -310,7 +352,7 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
         return;
 
     float tough = stats->_toughness;
-    float power = RegenPower(tough);
+    float power = RegenPower(me, tough);
     if (power <= 0.f) return;
     if (power > 4.f) power = 4.f;
 
@@ -405,7 +447,6 @@ static void (*medicalUpdate_orig)(MedicalSystem*, float) = nullptr;
 static void medicalUpdate_hook(MedicalSystem* self, float frameTime)
 {
     medicalUpdate_orig(self, frameTime);
-    ApplyTestStartToughness(self);
     ApplyFoodRegen(self, frameTime);
 }
 
@@ -495,16 +536,5 @@ extern "C" TF_EXPORT void startPlugin()
         ErrorLog("ToughnessFeast: failed to hook MedicalSystem::medicalUpdate");
     }
 
-    if (g_cfg.enableTestStart)
-    {
-        char msg[192];
-        std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: ready — TEST START ON (player toughness floor %.0f)",
-            g_cfg.testStartToughness);
-        DebugLog(msg);
-    }
-    else
-    {
-        DebugLog("ToughnessFeast: ready — toughness past 100 trades combat soft-cap for food regen");
-    }
+    DebugLog("ToughnessFeast: ready — race regen: Hiver@0 Shek@50 Human@75, combat soft-cap 100");
 }
