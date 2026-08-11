@@ -119,7 +119,7 @@ static Config g_cfg = {
     1, 1, 1, 1, 1, 1,             // hooks/medical/limb/tooltips/penalty/debug
     100.f,                        // combatCap
     75.f, 50.f, 0.f,              // unlocks H/S/Hiv
-    0.045f, 0.014f, 3.0f,         // scale, hiver scale, power cap
+    0.045f, 0.022f, 3.0f,         // scale, hiver scale, power cap
     1.35f, 0.9f, 0.012f, 0.15f, 1,// flesh, stun, hunger drain, minHunger, unhealable
     0.085f, 0.40f, 0.12f, 0.18f, 0.70f, 0.40f, // regrow/bud/stumpForm/start/strong/overdmg
     0.28f, 0.55f, 8.0f, 18.0f,    // stumpHunger, restoreHunger, stumpKO, restoreKO
@@ -396,6 +396,21 @@ static void SetToughness(CharStats* stats, float t)
 
 enum RaceKind { RACE_UNKNOWN=0, RACE_HUMAN, RACE_SHEK, RACE_HIVER, RACE_ROBOT };
 
+static CharStats* StatsFromMedical(MedicalSystem* med)
+{
+    if (!med) return nullptr;
+    // Game offsets: me @ 0xE0 (Character*)
+    Character* me = nullptr;
+    std::memcpy(&me, (const char*)(void*)med + 0xE0, sizeof(me));
+    if (!me || (uintptr_t)me < 0x10000ull) return nullptr;
+    CharStats* st = nullptr;
+    TF_SEH_TRY { st = me->getStats(); }
+    TF_SEH_EXCEPT { st = nullptr; }
+    if (st) return st;
+    // CharStats often at Character path — also try medical field if present
+    return nullptr;
+}
+
 static Character* CharFromStats(CharStats* stats)
 {
     if (!stats) return nullptr;
@@ -452,35 +467,61 @@ static int MsvcStrContains(const char* strObj, const char* needle)
 
 static RaceKind DetectRace(CharStats* stats)
 {
+    // RaceData C++ field layout is UNRELIABLE (boost containers shift offsets).
+    // Only use getRace() + raw game offsets from KenshiLib comments.
     TF_SEH_TRY
     {
         RaceData* race = RaceFromStats(stats);
         if (!race || (uintptr_t)race < 0x10000ull) return RACE_UNKNOWN;
-        if (race->robot) return RACE_ROBOT;
-        if (race->gigantic) return RACE_SHEK;
 
-        if (race->data)
+        const char* rb = (const char*)(void*)race;
+        GameData* data = nullptr;
+        float hungerRate = 1.f;
+        unsigned char gigantic = 0, robot = 0, singleGender = 0;
+        unsigned char noHats = 0, noShirts = 0, noShoes = 0;
+        std::memcpy(&data,       rb + 0x40, sizeof(data));
+        std::memcpy(&hungerRate, rb + 0x70, sizeof(hungerRate));
+        std::memcpy(&gigantic,   rb + 0x78, 1);
+        std::memcpy(&singleGender, rb + 0x7B, 1);
+        std::memcpy(&robot,      rb + 0x7C, 1);
+        std::memcpy(&noHats,     rb + 0x7E, 1);
+        std::memcpy(&noShirts,   rb + 0x7F, 1);
+        std::memcpy(&noShoes,    rb + 0x80, 1);
+
+        if (robot) return RACE_ROBOT;
+
+        // Name / stringID on GameData (MSVC2010 strings @ 0x28 / 0x58)
+        if (data && (uintptr_t)data > 0x10000ull)
         {
-            const char* base = (const char*)(void*)race->data;
-            if ((uintptr_t)base > 0x10000ull)
-            {
-                if (MsvcStrContains(base + 0x58, "hive") || MsvcStrContains(base + 0x28, "hive")
-                 || MsvcStrContains(base + 0x58, "hiver") || MsvcStrContains(base + 0x28, "hiver"))
-                    return RACE_HIVER;
-                if (MsvcStrContains(base + 0x58, "shek") || MsvcStrContains(base + 0x28, "shek"))
-                    return RACE_SHEK;
-                if (MsvcStrContains(base + 0x58, "skeleton") || MsvcStrContains(base + 0x28, "skeleton"))
-                    return RACE_ROBOT;
-            }
+            const char* base = (const char*)(void*)data;
+            if (MsvcStrContains(base + 0x58, "hive") || MsvcStrContains(base + 0x28, "hive")
+             || MsvcStrContains(base + 0x58, "hiver") || MsvcStrContains(base + 0x28, "hiver")
+             || MsvcStrContains(base + 0x58, "south hive") || MsvcStrContains(base + 0x28, "prince")
+             || MsvcStrContains(base + 0x58, "soldier drone") || MsvcStrContains(base + 0x28, "drone")
+             || MsvcStrContains(base + 0x58, "worker drone") || MsvcStrContains(base + 0x28, "worker"))
+                return RACE_HIVER;
+            if (MsvcStrContains(base + 0x58, "shek") || MsvcStrContains(base + 0x28, "shek"))
+                return RACE_SHEK;
+            if (MsvcStrContains(base + 0x58, "skeleton") || MsvcStrContains(base + 0x28, "skeleton")
+             || MsvcStrContains(base + 0x58, "robot") || MsvcStrContains(base + 0x28, "robot"))
+                return RACE_ROBOT;
+            if (MsvcStrContains(base + 0x58, "greenlander") || MsvcStrContains(base + 0x28, "greenlander")
+             || MsvcStrContains(base + 0x58, "scorchlander") || MsvcStrContains(base + 0x28, "scorch")
+             || MsvcStrContains(base + 0x58, "human") || MsvcStrContains(base + 0x28, "human"))
+                return RACE_HUMAN;
         }
-        // Hive anatomy / metabolism heuristics
-        if (race->noHats && (race->noShoes || race->noShirts)) return RACE_HIVER;
-        if (race->singleGender && race->hungerRate > 1.0f) return RACE_HIVER;
-        if (race->hungerRate > 1.05f) return RACE_HIVER;
+
+        if (gigantic) return RACE_SHEK;
+        // Hiver anatomy: no hats/shoes common
+        if (noHats && (noShoes || noShirts)) return RACE_HIVER;
+        if (singleGender && hungerRate > 0.9f) return RACE_HIVER;
+        // Hive metabolism often higher hunger rate
+        if (hungerRate > 1.05f && hungerRate < 10.f) return RACE_HIVER;
         return RACE_HUMAN;
     }
     TF_SEH_EXCEPT { return RACE_UNKNOWN; }
 }
+
 
 static const char* RaceName(RaceKind k)
 {
@@ -1152,6 +1193,54 @@ static void (*orig_xpTime)(CharStats*, StatsEnumerated) = nullptr;
 static int g_inRegen = 0;
 static void ApplyFeastTick(CharStats* stats, float dt); // fwd
 
+// Drive feast from health systems, not just XP
+static void DriveFeastFromMedical(MedicalSystem* med, float dt)
+{
+    if (!g_cfg.enableMedical || !med || g_inRegen) return;
+    if (dt != dt || dt <= 0.f) return;
+    if (dt > 0.25f) dt = 0.25f;
+    CharStats* stats = StatsFromMedical(med);
+    if (!stats)
+    {
+        // Fallback: med might be reachable from CharStats medical ptr reverse is hard
+        return;
+    }
+    ApplyFeastTick(stats, dt);
+}
+
+static void (*orig_medUpdate)(MedicalSystem*, float) = nullptr;
+static void hook_medUpdate(MedicalSystem* self, float frameTime)
+{
+    if (orig_medUpdate) orig_medUpdate(self, frameTime);
+    // Health tick every frame — primary feast driver
+    TF_SEH_TRY { DriveFeastFromMedical(self, frameTime); }
+    TF_SEH_EXCEPT
+    {
+        static int once = 0;
+        if (!once) { LogErr("ToughnessFeast: medUpdate feast SEH"); once = 1; }
+    }
+}
+
+static void (*orig_periodic)(MedicalSystem*) = nullptr;
+static void hook_periodic(MedicalSystem* self)
+{
+    if (orig_periodic) orig_periodic(self);
+    // Secondary slower tick
+    TF_SEH_TRY { DriveFeastFromMedical(self, 0.15f); }
+    TF_SEH_EXCEPT { }
+}
+
+// Optional: toughness XP bonus path runs when hurt — gentle feast nudge
+static float (*orig_toughXpBonus)(MedicalSystem*) = nullptr;
+static float hook_toughXpBonus(MedicalSystem* self)
+{
+    float r = orig_toughXpBonus ? orig_toughXpBonus(self) : 0.f;
+    // Don't do heavy work mid-hit; tiny tick only
+    TF_SEH_TRY { DriveFeastFromMedical(self, 0.05f); }
+    TF_SEH_EXCEPT { }
+    return r;
+}
+
 static void hook_xpTime(CharStats* self, StatsEnumerated st)
 {
     if (!orig_xpTime) return;
@@ -1177,14 +1266,15 @@ static void hook_xpTime(CharStats* self, StatsEnumerated st)
         orig_xpTime(self, st);
     }
 
-    // Periodic feast tick (not on hit). Throttle across all stat time ticks.
+    // XP time is secondary; medicalUpdate is primary
     if (g_cfg.enableMedical)
     {
         static int throttle = 0;
-        if ((++throttle % 8) == 0)
-            ApplyFeastTick(self, 0.12f);
+        if ((++throttle % 16) == 0)
+            ApplyFeastTick(self, 0.10f);
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Feast: limb regrow + unhealable wounds (hunger-paid)
@@ -2026,7 +2116,67 @@ static void InstallHooks()
                "ToughnessFeast: XP event past 100");
     HookExport("?xpStat_timeBased@CharStats@@QEAAXW4StatsEnumerated@@@Z",
                (void*)hook_xpTime, (void**)&orig_xpTime,
-               "ToughnessFeast: XP time + feast tick");
+               "ToughnessFeast: XP time (secondary feast)");
+
+    // PRIMARY feast drivers: medical / health systems
+    int medOk = 0;
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    {
+        void* real = nullptr;
+        TF_SEH_TRY
+        {
+            intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::medicalUpdate);
+            if (a) real = (void*)a;
+        }
+        TF_SEH_EXCEPT { real = nullptr; }
+        if (!real)
+        {
+            HMODULE exe = GetModuleHandleA(nullptr);
+            if (exe) real = (void*)((unsigned char*)exe + 0x651880);
+        }
+        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_medUpdate, (void**)&orig_medUpdate))
+        {
+            Log("ToughnessFeast: medicalUpdate feast tick");
+            medOk = 1;
+        }
+        else
+            LogErr("ToughnessFeast: medicalUpdate hook FAILED");
+    }
+    {
+        void* real = nullptr;
+        TF_SEH_TRY
+        {
+            intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::periodicUpdate);
+            if (a) real = (void*)a;
+        }
+        TF_SEH_EXCEPT { real = nullptr; }
+        if (!real)
+        {
+            HMODULE exe = GetModuleHandleA(nullptr);
+            if (exe) real = (void*)((unsigned char*)exe + 0x64D2F0);
+        }
+        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_periodic, (void**)&orig_periodic))
+            Log("ToughnessFeast: periodicUpdate feast tick");
+    }
+    {
+        void* real = nullptr;
+        TF_SEH_TRY
+        {
+            intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::getToughnessXpBonus);
+            if (a) real = (void*)a;
+        }
+        TF_SEH_EXCEPT { real = nullptr; }
+        if (!real)
+        {
+            HMODULE exe = GetModuleHandleA(nullptr);
+            if (exe) real = (void*)((unsigned char*)exe + 0x8C4790);
+        }
+        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_toughXpBonus, (void**)&orig_toughXpBonus))
+            Log("ToughnessFeast: toughnessXpBonus (dmg-related) feast nudge");
+    }
+#endif
+    if (!medOk)
+        Log("ToughnessFeast: falling back to XP/tip feast drivers only");
 
     if (g_cfg.enableTooltips)
     {
