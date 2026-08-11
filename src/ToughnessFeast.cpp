@@ -1193,26 +1193,58 @@ static void (*orig_xpTime)(CharStats*, StatsEnumerated) = nullptr;
 static int g_inRegen = 0;
 static void ApplyFeastTick(CharStats* stats, float dt); // fwd
 
-// Drive feast from health systems, not just XP
+// SINGLE feast driver: MedicalSystem::medicalUpdate only (throttled).
+// No damage hooks, no periodic double-hook, no tip-side setLimb spam.
 static void DriveFeastFromMedical(MedicalSystem* med, float dt)
 {
     if (!g_cfg.enableMedical || !med || g_inRegen) return;
     if (dt != dt || dt <= 0.f) return;
-    if (dt > 0.25f) dt = 0.25f;
-    CharStats* stats = StatsFromMedical(med);
-    if (!stats)
+
+    // Throttle: at most ~3 Hz per MedicalSystem* (avoid assert spam / re-entry)
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    struct Slot { MedicalSystem* med; unsigned lastMs; float accum; };
+    static Slot slots[48];
+    static int nSlots = 0;
+    unsigned now = GetTickCount();
+    Slot* s = nullptr;
+    for (int i = 0; i < nSlots; ++i)
+        if (slots[i].med == med) { s = &slots[i]; break; }
+    if (!s && nSlots < 48)
     {
-        // Fallback: med might be reachable from CharStats medical ptr reverse is hard
-        return;
+        s = &slots[nSlots++];
+        s->med = med;
+        s->lastMs = 0;
+        s->accum = 0.f;
     }
-    ApplyFeastTick(stats, dt);
+    float useDt = dt;
+    if (s)
+    {
+        if (s->lastMs != 0 && (now - s->lastMs) < 350u)
+        {
+            s->accum += dt;
+            return;
+        }
+        useDt = s->accum + dt;
+        s->accum = 0.f;
+        s->lastMs = now;
+    }
+#else
+    float useDt = dt;
+#endif
+    if (useDt > 0.40f) useDt = 0.40f;
+    if (useDt < 0.08f) useDt = 0.08f;
+
+    CharStats* stats = StatsFromMedical(med);
+    if (!stats) return;
+    ApplyFeastTick(stats, useDt);
 }
 
 static void (*orig_medUpdate)(MedicalSystem*, float) = nullptr;
 static void hook_medUpdate(MedicalSystem* self, float frameTime)
 {
+    // Always run original first — never skip game medical
     if (orig_medUpdate) orig_medUpdate(self, frameTime);
-    // Health tick every frame — primary feast driver
+    if (!g_cfg.enableMedical || !self) return;
     TF_SEH_TRY { DriveFeastFromMedical(self, frameTime); }
     TF_SEH_EXCEPT
     {
@@ -1221,59 +1253,25 @@ static void hook_medUpdate(MedicalSystem* self, float frameTime)
     }
 }
 
-static void (*orig_periodic)(MedicalSystem*) = nullptr;
-static void hook_periodic(MedicalSystem* self)
-{
-    if (orig_periodic) orig_periodic(self);
-    // Secondary slower tick
-    TF_SEH_TRY { DriveFeastFromMedical(self, 0.15f); }
-    TF_SEH_EXCEPT { }
-}
-
-// Optional: toughness XP bonus path runs when hurt — gentle feast nudge
-static float (*orig_toughXpBonus)(MedicalSystem*) = nullptr;
-static float hook_toughXpBonus(MedicalSystem* self)
-{
-    float r = orig_toughXpBonus ? orig_toughXpBonus(self) : 0.f;
-    // Don't do heavy work mid-hit; tiny tick only
-    TF_SEH_TRY { DriveFeastFromMedical(self, 0.05f); }
-    TF_SEH_EXCEPT { }
-    return r;
-}
-
+// XP past 100 only — does NOT drive feast / setLimb
 static void hook_xpTime(CharStats* self, StatsEnumerated st)
 {
     if (!orig_xpTime) return;
-    if (!self)
+    if (!self || st != STAT_TOUGHNESS)
     {
         orig_xpTime(self, st);
         return;
     }
-
-    if (st == STAT_TOUGHNESS)
+    float before = GetToughness(self);
+    orig_xpTime(self, st);
+    if (before >= 99.5f && GetToughness(self) <= before + 0.0001f)
     {
-        float before = GetToughness(self);
-        orig_xpTime(self, st);
-        if (before >= 99.5f && GetToughness(self) <= before + 0.0001f)
-        {
-            float over = (before > 100.f) ? (before - 100.f) : 0.f;
-            float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
-            SetToughness(self, before + 0.002f * mult);
-        }
-    }
-    else
-    {
-        orig_xpTime(self, st);
-    }
-
-    // XP time is secondary; medicalUpdate is primary
-    if (g_cfg.enableMedical)
-    {
-        static int throttle = 0;
-        if ((++throttle % 16) == 0)
-            ApplyFeastTick(self, 0.10f);
+        float over = (before > 100.f) ? (before - 100.f) : 0.f;
+        float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
+        SetToughness(self, before + 0.002f * mult);
     }
 }
+
 
 
 // ---------------------------------------------------------------------------
@@ -1448,6 +1446,12 @@ static void ProcessLimbs(
                 int ready = (flesh >= formNeed * 0.95f) || (flesh >= maxHp * 0.95f && flesh > 0.f) ? 1 : 0;
                 if (ready)
                 {
+                    static unsigned s_scd[4] = {0,0,0,0};
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+                    unsigned now = GetTickCount();
+                    if (s_scd[i] && (now - s_scd[i]) < 5000u) continue;
+                    s_scd[i] = now;
+#endif
                     ForceFormStump(med, i);
                     anyHeal = 1;
                     SpendHungerAndKnockout(med, g_cfg.stumpHungerCost, g_cfg.stumpKoSeconds,
@@ -1516,11 +1520,14 @@ static void ProcessLimbs(
 
                 if (ready)
                 {
+                    // Cooldown so we don't hammer setLimb every medical tick
+                    static unsigned s_cd[4] = {0,0,0,0};
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+                    unsigned now = GetTickCount();
+                    if (s_cd[i] && (now - s_cd[i]) < 5000u) continue;
+                    s_cd[i] = now;
+#endif
                     int restored = ForceRestoreOrganicLimb(med, i);
-                    // Retry once next frame if still stump — still KO/food this time
-                    if (!restored)
-                        ForceRestoreOrganicLimb(med, i);
-
                     anyHeal = 1;
                     if (worstSev < 0.85f) worstSev = 0.85f;
 
@@ -1532,7 +1539,7 @@ static void ProcessLimbs(
                     SpendHungerAndKnockout(med, g_cfg.restoreHungerCost, g_cfg.restoreKoSeconds, why);
 
                     if (after != LIMB_ORIGINAL && g_cfg.debugLog)
-                        Log("ToughnessFeast: still not ORIGINAL after ForceRestore — will retry next tick");
+                        Log("ToughnessFeast: still not ORIGINAL — retry in 5s");
                     continue;
                 }
             }
@@ -1902,99 +1909,6 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
     if (med)
         nLimbs = CollectLimbs(stats, limbs, 4);
 
-    // CRITICAL: hunger tip is the one place we KNOW runs for this character.
-    // xpStat_timeBased can be sparse while idle — drive feast + ready restores here.
-    {
-        static unsigned s_lastTickMs = 0;
-        unsigned now = 0;
-#if !defined(TOUGHNESSFEAST_LINUX_IDE)
-        now = GetTickCount();
-#else
-        static unsigned fake = 0; now = ++fake * 50;
-#endif
-        if (s_lastTickMs == 0 || (now - s_lastTickMs) >= 250u)
-        {
-            s_lastTickMs = now;
-            TF_SEH_TRY { ApplyFeastTick(stats, 0.25f); }
-            TF_SEH_EXCEPT { LogErr("ToughnessFeast: tip ApplyFeastTick SEH"); }
-        }
-
-        // Immediate restore for any stump that CollectLimbs marks READY
-        // (bud 100% / "READY — restoring")
-        static unsigned s_lastForceMs[4] = {0, 0, 0, 0};
-        for (int i = 0; i < nLimbs && i < 4; ++i)
-        {
-            if (!limbs[i].missing) continue;
-            // READY text is written into detail by CollectLimbs
-            int ready = 0;
-            if (std::strstr(limbs[i].detail, "READY") != nullptr) ready = 1;
-            if (std::strstr(limbs[i].stage, "Stump") != nullptr &&
-                std::strstr(limbs[i].detail, "100") != nullptr) ready = 1;
-            // Also re-check flesh for stump
-            if (!ready && med)
-            {
-                LimbState st = ReadLimbState(med, i);
-                if (st == LIMB_STUMP || st == LIMB_CRUSHED)
-                {
-                    MedicalSystem::HealthPartStatus* part = ResolveLimb(med, i);
-                    if (st == LIMB_CRUSHED && !part) ready = 1;
-                    if (part)
-                    {
-                        float maxHp = PartMaxHp(part);
-                        float flesh = part->flesh;
-                        if (flesh != flesh) flesh = 0.f;
-                        if (st == LIMB_STUMP)
-                        {
-                            float target = LimbBudTarget(maxHp);
-                            float prog = target > 0.01f ? ((flesh > 0.f ? flesh : 0.f) / target) : 0.f;
-                            if (prog >= 0.95f || flesh >= maxHp * 0.90f) ready = 1;
-                        }
-                    }
-                }
-            }
-            if (!ready) continue;
-            if (s_lastForceMs[i] != 0 && (now - s_lastForceMs[i]) < 2000u) continue;
-            s_lastForceMs[i] = now;
-
-            char msg[96];
-            std::snprintf(msg, sizeof(msg),
-                "ToughnessFeast: tip-force restore slot %d (%s)", i, limbs[i].name);
-            Log(msg);
-
-            int ok = 0;
-            TF_SEH_TRY
-            {
-                if (ReadLimbState(med, i) == LIMB_CRUSHED)
-                    ok = ForceFormStump(med, i);
-                else
-                    ok = ForceRestoreOrganicLimb(med, i);
-            }
-            TF_SEH_EXCEPT { LogErr("ToughnessFeast: tip-force SEH"); ok = 0; }
-
-            // Cost based on pre-restore intent (stump→limb uses restore cost)
-            {
-                int wasCrushed = (std::strstr(limbs[i].stage, "Missing") != nullptr) ? 1 : 0;
-                float cost = wasCrushed ? g_cfg.stumpHungerCost : g_cfg.restoreHungerCost;
-                float ko = wasCrushed ? g_cfg.stumpKoSeconds : g_cfg.restoreKoSeconds;
-                SpendHungerAndKnockout(med, cost, ko, "tip-force stage complete");
-            }
-            if (!ok)
-            {
-                LimbState after = ReadLimbState(med, i);
-                std::snprintf(msg, sizeof(msg),
-                    "ToughnessFeast: tip-force FAILED slot %d state=%d", i, (int)after);
-                Log(msg);
-            }
-            else
-            {
-                LimbState after = ReadLimbState(med, i);
-                std::snprintf(msg, sizeof(msg),
-                    "ToughnessFeast: tip-force OK slot %d state=%d", i, (int)after);
-                Log(msg);
-            }
-        }
-    }
-
     int active = 0, missing = 0;
     line("-- Limbs --", "4 slots");
     if (nLimbs <= 0)
@@ -2116,10 +2030,9 @@ static void InstallHooks()
                "ToughnessFeast: XP event past 100");
     HookExport("?xpStat_timeBased@CharStats@@QEAAXW4StatsEnumerated@@@Z",
                (void*)hook_xpTime, (void**)&orig_xpTime,
-               "ToughnessFeast: XP time (secondary feast)");
+               "ToughnessFeast: XP time past 100 only");
 
-    // PRIMARY feast drivers: medical / health systems
-    int medOk = 0;
+    // ONLY feast driver: medicalUpdate (throttled inside hook)
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
     {
         void* real = nullptr;
@@ -2135,48 +2048,12 @@ static void InstallHooks()
             if (exe) real = (void*)((unsigned char*)exe + 0x651880);
         }
         if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_medUpdate, (void**)&orig_medUpdate))
-        {
-            Log("ToughnessFeast: medicalUpdate feast tick");
-            medOk = 1;
-        }
+            Log("ToughnessFeast: medicalUpdate feast (throttled, sole driver)");
         else
-            LogErr("ToughnessFeast: medicalUpdate hook FAILED");
-    }
-    {
-        void* real = nullptr;
-        TF_SEH_TRY
-        {
-            intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::periodicUpdate);
-            if (a) real = (void*)a;
-        }
-        TF_SEH_EXCEPT { real = nullptr; }
-        if (!real)
-        {
-            HMODULE exe = GetModuleHandleA(nullptr);
-            if (exe) real = (void*)((unsigned char*)exe + 0x64D2F0);
-        }
-        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_periodic, (void**)&orig_periodic))
-            Log("ToughnessFeast: periodicUpdate feast tick");
-    }
-    {
-        void* real = nullptr;
-        TF_SEH_TRY
-        {
-            intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::getToughnessXpBonus);
-            if (a) real = (void*)a;
-        }
-        TF_SEH_EXCEPT { real = nullptr; }
-        if (!real)
-        {
-            HMODULE exe = GetModuleHandleA(nullptr);
-            if (exe) real = (void*)((unsigned char*)exe + 0x8C4790);
-        }
-        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_toughXpBonus, (void**)&orig_toughXpBonus))
-            Log("ToughnessFeast: toughnessXpBonus (dmg-related) feast nudge");
+            LogErr("ToughnessFeast: medicalUpdate hook FAILED — no feast regen");
     }
 #endif
-    if (!medOk)
-        Log("ToughnessFeast: falling back to XP/tip feast drivers only");
+
 
     if (g_cfg.enableTooltips)
     {
