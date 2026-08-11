@@ -1,7 +1,6 @@
 #include <Debug.h>
-// Load-test only: proves RE_Kenshi can init our DLL without hooks.
-// Export must be C++ mangled ?startPlugin@@YAXXZ
+// True HelloWorld — only DebugLog import. No game hooks, no config.
 __declspec(dllexport) void startPlugin()
 {
-    DebugLog("ToughnessFeast MINIMAL: loaded OK (no hooks)");
+    DebugLog("ToughnessFeast MINIMAL: startPlugin OK");
 }
