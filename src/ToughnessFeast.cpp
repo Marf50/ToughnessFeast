@@ -612,6 +612,91 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
 // Toughness hover: overview only (easy to scan)
 static int g_tooltipOnce = 0;
 
+
+// Truncate lektor at our previous TF header so values can refresh each hover.
+static void StripPreviousTfBlock(lektor<StringPair>* dats)
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    (void)dats;
+#else
+    if (!dats || !dats->stuff || dats->count == 0) return;
+    static const size_t kPair = 0x60;
+    unsigned n = dats->count;
+    if (n > 64) n = 64;
+    for (unsigned i = 0; i < n; ++i)
+    {
+        const char* base = (const char*)(void*)dats->stuff + (size_t)i * kPair;
+        // left string @ +0x8 inside StringPair
+        const unsigned char* sp = (const unsigned char*)base + 0x8;
+        size_t size = 0, res = 0;
+        std::memcpy(&size, sp + 16, sizeof(size));
+        std::memcpy(&res, sp + 24, sizeof(res));
+        if (size == 0 || size > 80 || res > 0x200000u) continue;
+        const char* data = nullptr;
+        if (res < 16u) data = (const char*)sp;
+        else std::memcpy(&data, sp, sizeof(data));
+        if (!data) continue;
+        // Match our headers
+        if (std::strncmp(data, "== Toughness Feast", 18) == 0
+            || std::strncmp(data, "========", 8) == 0
+            || std::strncmp(data, "Toughness Feast", 15) == 0)
+        {
+            dats->count = i; // drop TF block and anything we appended after
+            return;
+        }
+    }
+#endif
+}
+
+
+// Live TF status snapshot (updated from regen tick — tooltips read this so numbers stay current)
+struct TfLiveStatus
+{
+    float toughness;
+    float power;
+    float hungerPct;
+    float foodUse;
+    float unlock;
+    int activeLimbs;
+    char race[16];
+    char limbLine[4][64]; // "Left Arm|MISSING|detail"
+    int nLimbs;
+    int valid;
+};
+static TfLiveStatus g_tfLive = {};
+
+static void RefreshTfLiveStatus(CharStats* stats)
+{
+    if (!stats) return;
+    std::memset(&g_tfLive, 0, sizeof(g_tfLive));
+    g_tfLive.toughness = stats->_toughness;
+    g_tfLive.unlock = FoodRegenStartFor(stats);
+    g_tfLive.power = RegenPowerOf(stats);
+    g_tfLive.foodUse = FoodUsePercentPerSec(stats);
+    const char* rn = RaceKindName(DetectRaceKind(stats));
+    std::snprintf(g_tfLive.race, sizeof(g_tfLive.race), "%s", rn ? rn : "?");
+    MedicalSystem* med = stats->medical;
+    if (med && !med->dead)
+    {
+        float h = med->hunger;
+        if (h == h && h >= 0.f && h <= 5.f)
+            g_tfLive.hungerPct = h * 100.f;
+        else
+            g_tfLive.hungerPct = -1.f;
+        LimbTip limbs[4];
+        int n = CollectLimbTips(stats, limbs, 4);
+        g_tfLive.nLimbs = n;
+        g_tfLive.activeLimbs = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            if (limbs[i].active) g_tfLive.activeLimbs++;
+            std::snprintf(g_tfLive.limbLine[i], sizeof(g_tfLive.limbLine[i]),
+                "%s|%s|%s", limbs[i].name, limbs[i].stage, limbs[i].detail);
+        }
+    }
+    g_tfLive.valid = 1;
+}
+
 // SAFE hunger tooltip only — short fixed lines, no anatomy scan, no GameData names.
 // Expanded body-bar scanner caused ACCESS_VIOLATION (dump c0000005).
 static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
@@ -619,8 +704,13 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
     if (!dats || !stats) return;
     if (!dats->stuff || dats->maxSize < 4) return;
 
-    // Hard cap: never write more than this many new lines (avoid stomping heap)
-    const unsigned kBudget = 14;
+    // Remove last TF block so re-hover / re-build shows fresh numbers
+    StripPreviousTfBlock(dats);
+
+    // Pull latest medical numbers right now (not from first load)
+    RefreshTfLiveStatus(stats);
+
+    const unsigned kBudget = 16;
     unsigned startCount = dats->count;
 
     auto room = [&]() -> int {
@@ -637,8 +727,18 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
     float pwr = RegenPowerOf(stats);
     float foodUse = FoodUsePercentPerSec(stats);
     RaceKind rk = DetectRaceKind(stats);
+    MedicalSystem* med = stats->medical;
 
-    line("== Toughness Feast ==", "Hunger tip");
+    // Live hunger read every call
+    float hungerPct = -1.f;
+    if (med && !med->dead)
+    {
+        float h = med->hunger;
+        if (h == h && h >= 0.f && h <= 5.f)
+            hungerPct = h * 100.f;
+    }
+
+    line("== Toughness Feast ==", "live");
     {
         char r[40];
         const char* race = RaceKindName(rk);
@@ -648,8 +748,14 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
     }
     {
         char r[40];
-        std::snprintf(r, sizeof(r), "%.0f (cap %.0f)", stats->_toughness, g_cfg.combatCapToughness);
+        std::snprintf(r, sizeof(r), "%.1f (cap %.0f)", stats->_toughness, g_cfg.combatCapToughness);
         line("Toughness", r);
+    }
+    if (hungerPct >= 0.f)
+    {
+        char r[40];
+        std::snprintf(r, sizeof(r), "%.0f%%", hungerPct);
+        line("Hunger now", r);
     }
 
     if (pwr <= 0.f)
@@ -662,28 +768,24 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
     else
     {
         char r[40];
-        std::snprintf(r, sizeof(r), "ON pwr %.1f", pwr);
+        std::snprintf(r, sizeof(r), "ON pwr %.2f", pwr);
         line("Food regen", r);
-        std::snprintf(r, sizeof(r), "~%.1f%%/s", foodUse);
+        std::snprintf(r, sizeof(r), "~%.2f%%/s", foodUse);
         line("Food drain", r);
     }
 
-    // Limbs via getPart(Limb) only — same path as regen (no getPartCount scan)
     LimbTip limbs[4];
     int n = 0;
-    // CollectLimbTips can call into medical; only if medical looks alive
-    MedicalSystem* med = stats->medical;
     if (med && !med->dead)
         n = CollectLimbTips(stats, limbs, 4);
 
+    int active = 0;
     if (n > 0)
         line("-- Limbs --", "stage");
-    int active = 0;
     for (int i = 0; i < n; ++i)
     {
         if (limbs[i].active) ++active;
         line(limbs[i].name, limbs[i].stage);
-        // detail only for active (saves lines / less ctor traffic)
         if (limbs[i].active)
             line(" ", limbs[i].detail);
     }
@@ -697,13 +799,15 @@ static void AppendFullTfTooltips(lektor<StringPair>* dats, CharStats* stats)
 
     line("== end TF ==", "-");
 
-    if (!g_tooltipOnce)
+    // Log every ~15 tip rebuilds so we can see values changing
+    static int s_tipLog = 0;
+    if (g_cfg.debugLog && ((++s_tipLog) % 15) == 1)
     {
-        char mbuf[96];
-        std::snprintf(mbuf, sizeof(mbuf), "ToughnessFeast: hunger tip ok lines=%u",
-            (unsigned)(dats->count - startCount));
+        char mbuf[128];
+        std::snprintf(mbuf, sizeof(mbuf),
+            "ToughnessFeast: tip refresh t=%.1f p=%.2f h=%.0f limbs=%d",
+            stats->_toughness, pwr, hungerPct, active);
         DebugLog(mbuf);
-        g_tooltipOnce = 1;
     }
 }
 
@@ -981,6 +1085,7 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
 
     // Always refresh HUD (even with 0 power — shows unlock threshold)
     g_lastStats = stats;
+    RefreshTfLiveStatus(stats);
     RefreshStatusHud(stats);
 
     if (power <= 0.f) return;
@@ -1094,6 +1199,7 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
     }
 
     g_lastStats = stats;
+    RefreshTfLiveStatus(stats);
     RefreshStatusHud(stats);
     g_inFoodRegen = 0;
 }
@@ -1105,30 +1211,42 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
 static float (*calculateToughnessDamageResistanceMult_orig)(CharStats*) = nullptr;
 static float calculateToughnessDamageResistanceMult_hook(CharStats* self)
 {
-    // Soft-cap combat DR only. NEVER limb regen / setLimb here (mid-hit crash).
-    if (!self || !calculateToughnessDamageResistanceMult_orig)
+    // Soft-cap combat DR only. NEVER limb regen / setLimb here.
+    // Under cap: pure passthrough so toughness tooltips stay correct
+    // (forcing return 1.f previously looked like "100% dmg resist").
+    if (!calculateToughnessDamageResistanceMult_orig)
         return 1.f;
-    float saved = self->_toughness;
-    if (saved > g_cfg.combatCapToughness && saved < 500.f)
-        self->_toughness = g_cfg.combatCapToughness;
+    if (!self)
+        return calculateToughnessDamageResistanceMult_orig(self);
+
+    float t = self->_toughness;
+    // Only soft-cap clearly super-human values; leave normal range alone
+    if (!(t > g_cfg.combatCapToughness + 0.05f && t < 400.f))
+        return calculateToughnessDamageResistanceMult_orig(self);
+
+    self->_toughness = g_cfg.combatCapToughness;
     float r = calculateToughnessDamageResistanceMult_orig(self);
-    self->_toughness = saved;
-    if (r != r || r < 0.f) r = 1.f;
+    self->_toughness = t;
+    if (r != r) r = calculateToughnessDamageResistanceMult_orig(self); // NaN only
     return r;
 }
 
 static float (*calculateToughnessWoundDegenerationRate_orig)(CharStats*) = nullptr;
 static float calculateToughnessWoundDegenerationRate_hook(CharStats* self)
 {
-    // Soft-cap wound degen only — no medical writes (combat-safe).
-    if (!self || !calculateToughnessWoundDegenerationRate_orig)
+    if (!calculateToughnessWoundDegenerationRate_orig)
         return 1.f;
-    float saved = self->_toughness;
-    if (saved > g_cfg.combatCapToughness && saved < 500.f)
-        self->_toughness = g_cfg.combatCapToughness;
+    if (!self)
+        return calculateToughnessWoundDegenerationRate_orig(self);
+
+    float t = self->_toughness;
+    if (!(t > g_cfg.combatCapToughness + 0.05f && t < 400.f))
+        return calculateToughnessWoundDegenerationRate_orig(self);
+
+    self->_toughness = g_cfg.combatCapToughness;
     float r = calculateToughnessWoundDegenerationRate_orig(self);
-    self->_toughness = saved;
-    if (r != r || r < 0.f) r = 1.f;
+    self->_toughness = t;
+    if (r != r) r = calculateToughnessWoundDegenerationRate_orig(self);
     return r;
 }
 
