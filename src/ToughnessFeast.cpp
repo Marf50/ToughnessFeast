@@ -13,7 +13,9 @@
 //   Human  ~75
 //
 // Limb stages: Overdamage → Budding (stump) → Restored weak → Strengthening → OK
-// setLimb is only used at the bud→restore transition; part* is always re-fetched.
+// Limb pipeline: Crushed/Missing → (bud) → setLimb(STUMP) + food dump + KO
+//                 Stump → (bud) → setLimb(ORIGINAL) + big food dump + longer KO
+//                 Weak ORIGINAL → strengthen. part* always re-fetched after setLimb.
 //
 // UI: Hunger tooltip is the Feast journal (stable hook). No MyGUI windows.
 // Safety: no medical writes on hit/DR path; SEH around race/tooltip/regrow;
@@ -94,10 +96,15 @@ struct Config
     int   healUnhealable;
 
     float limbRegrowPerSec;       // very slow by design
-    float limbBudThreshold;       // stump flesh% before setLimb
+    float limbBudThreshold;       // stump flesh% before full restore
+    float limbStumpFormPct;       // crushed flesh% before forming stump
     float limbRestoredStart;      // flesh% right after restore
     float limbStrongPct;          // above this = combat OK
     float overdamageHealMult;     // slower healing of negative HP
+    float stumpHungerCost;        // hunger bar fraction spent forming stump
+    float restoreHungerCost;      // hunger bar fraction spent on full restore
+    float stumpKoSeconds;         // KO duration when stump forms
+    float restoreKoSeconds;       // KO duration when limb returns
 
     float past100XpMult;
     float weakLimbDmgMult;        // skillMultDamage scale while weak
@@ -114,7 +121,8 @@ static Config g_cfg = {
     75.f, 50.f, 0.f,              // unlocks H/S/Hiv
     0.045f, 0.014f, 3.0f,         // scale, hiver scale, power cap
     1.35f, 0.9f, 0.012f, 0.15f, 1,// flesh, stun, hunger drain, minHunger, unhealable
-    0.07f, 0.40f, 0.18f, 0.70f, 0.40f, // limb regrow/bud/start/strong/overdmg
+    0.085f, 0.40f, 0.12f, 0.18f, 0.70f, 0.40f, // regrow/bud/stumpForm/start/strong/overdmg
+    0.28f, 0.55f, 8.0f, 18.0f,    // stumpHunger, restoreHunger, stumpKO, restoreKO
     0.20f,                        // past100 xp
     0.88f, 0.90f, 0.92f, 0.90f,   // weak limb combat mults
     16                            // tooltip lines
@@ -235,6 +243,11 @@ static void LoadConfig()
         else if (!std::strcmp(key, "HealUnhealableWounds")) g_cfg.healUnhealable = bval();
         else if (!std::strcmp(key, "LimbRegrowPerSecond")) g_cfg.limbRegrowPerSec = fval();
         else if (!std::strcmp(key, "LimbBudThreshold")) g_cfg.limbBudThreshold = fval();
+        else if (!std::strcmp(key, "LimbStumpFormPct")) g_cfg.limbStumpFormPct = fval();
+        else if (!std::strcmp(key, "StumpHungerCost")) g_cfg.stumpHungerCost = fval();
+        else if (!std::strcmp(key, "RestoreHungerCost")) g_cfg.restoreHungerCost = fval();
+        else if (!std::strcmp(key, "StumpKnockoutSeconds")) g_cfg.stumpKoSeconds = fval();
+        else if (!std::strcmp(key, "RestoreKnockoutSeconds")) g_cfg.restoreKoSeconds = fval();
         else if (!std::strcmp(key, "LimbRestoredStartPct")) g_cfg.limbRestoredStart = fval();
         else if (!std::strcmp(key, "LimbStrongPct")) g_cfg.limbStrongPct = fval();
         else if (!std::strcmp(key, "OverdamageHealMult")) g_cfg.overdamageHealMult = fval();
@@ -251,6 +264,12 @@ static void LoadConfig()
     if (g_cfg.combatCap < 50.f) g_cfg.combatCap = 50.f;
     if (g_cfg.limbBudThreshold < 0.15f) g_cfg.limbBudThreshold = 0.15f;
     if (g_cfg.limbBudThreshold > 0.9f) g_cfg.limbBudThreshold = 0.9f;
+    if (g_cfg.limbStumpFormPct < 0.05f) g_cfg.limbStumpFormPct = 0.05f;
+    if (g_cfg.limbStumpFormPct > 0.5f) g_cfg.limbStumpFormPct = 0.5f;
+    if (g_cfg.stumpHungerCost < 0.05f) g_cfg.stumpHungerCost = 0.05f;
+    if (g_cfg.restoreHungerCost < 0.1f) g_cfg.restoreHungerCost = 0.1f;
+    if (g_cfg.stumpKoSeconds < 1.f) g_cfg.stumpKoSeconds = 1.f;
+    if (g_cfg.restoreKoSeconds < 2.f) g_cfg.restoreKoSeconds = 2.f;
     if (g_cfg.minHunger < 0.f) g_cfg.minHunger = 0.f;
     if (g_cfg.minHunger > 0.9f) g_cfg.minHunger = 0.9f;
     if (g_cfg.tooltipMaxLines < 8) g_cfg.tooltipMaxLines = 8;
@@ -587,18 +606,29 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
             float pct = pos / maxHp;
             if (pct > 1.2f) pct = 1.2f;
 
-            if (st == LIMB_STUMP || st == LIMB_CRUSHED)
+            if (st == LIMB_CRUSHED)
+            {
+                float prog = (g_cfg.limbStumpFormPct > 0.01f)
+                    ? (pos / maxHp) / g_cfg.limbStumpFormPct : 0.f;
+                if (prog > 1.f) prog = 1.f;
+                std::snprintf(L.stage, sizeof(L.stage), "Missing");
+                std::snprintf(L.detail, sizeof(L.detail),
+                    "→stump %.0f%%  HP %.0f", prog * 100.f, raw);
+                L.active = 1;
+                L.missing = 1;
+                L.severity = 1.0f;
+            }
+            else if (st == LIMB_STUMP)
             {
                 float prog = (g_cfg.limbBudThreshold > 0.01f)
                     ? (pos / maxHp) / g_cfg.limbBudThreshold : 0.f;
                 if (prog > 1.f) prog = 1.f;
-                std::snprintf(L.stage, sizeof(L.stage), "%s",
-                    st == LIMB_CRUSHED ? "Crushed" : "MISSING");
+                std::snprintf(L.stage, sizeof(L.stage), "Stump");
                 std::snprintf(L.detail, sizeof(L.detail),
                     "bud %.0f%%  HP %.0f", prog * 100.f, raw);
                 L.active = 1;
                 L.missing = 1;
-                L.severity = 0.95f;
+                L.severity = 0.92f;
             }
             else if (st == LIMB_REPLACED)
             {
@@ -758,6 +788,42 @@ static void ApplyWeakLimbPenalty(CharStats* stats, float severity01)
     press(stats->skillMultDodge, g_cfg.weakLimbDodgeMult);
 }
 
+static void SpendHungerAndKnockout(MedicalSystem* med, float hungerFrac, float koSeconds, const char* reason)
+{
+    if (!med) return;
+    if (hungerFrac < 0.f) hungerFrac = 0.f;
+    if (hungerFrac > 0.95f) hungerFrac = 0.95f;
+    float h = med->hunger;
+    if (h == h && h >= 0.f && h <= 5.f)
+    {
+        h -= hungerFrac;
+        if (h < 0.f) h = 0.f;
+        med->hunger = h;
+    }
+    // Force a real KO so the player feels the transition
+    if (koSeconds > 0.f)
+    {
+        TF_SEH_TRY
+        {
+            med->knockoutForceTimer(koSeconds);
+        }
+        TF_SEH_EXCEPT
+        {
+            // Fallback: raw timer if call fails
+            med->knockoutTimer = koSeconds;
+            med->unconcious = true;
+        }
+    }
+    if (g_cfg.debugLog && reason)
+    {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+            "ToughnessFeast: %s  hunger-%.0f%%  KO %.0fs",
+            reason, hungerFrac * 100.f, koSeconds);
+        Log(msg);
+    }
+}
+
 static void ProcessLimbs(
     MedicalSystem* med, CharStats* stats, float power, float dt,
     float& hungerCost, int& anyHeal, float& worstSev)
@@ -767,6 +833,9 @@ static void ProcessLimbs(
     if (budget <= 0.f) return;
 
     RobotLimbs* robots = med->robotLimbs;
+    // Without robotLimbs we cannot change limb state (stump/restore)
+    if (!robots) return;
+
     static const RobotLimbs::Limb kEnum[4] = {
         RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
         RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
@@ -781,9 +850,15 @@ static void ProcessLimbs(
             if (part->isRobotic()) continue;
 
             LimbState st = part->getRobotLimbState();
-            LimbState table = st;
-            if (robots) table = robots->getState(kEnum[i]);
-            if (st == LIMB_REPLACED || table == LIMB_REPLACED) continue;
+            LimbState table = robots->getState(kEnum[i]);
+            // Prefer robotLimbs table when it disagrees (authoritative for setLimb)
+            if (table == LIMB_REPLACED || st == LIMB_REPLACED) continue;
+            // Use table state when it's crushed/stump even if part says otherwise
+            LimbState eff = st;
+            if (table == LIMB_CRUSHED || table == LIMB_STUMP)
+                eff = table;
+            else if (st == LIMB_ORIGINAL && (table == LIMB_ORIGINAL || table == LIMB_ORIGINAL))
+                eff = st;
 
             float maxHp = part->maxHealth();
             if (maxHp < 1.f) maxHp = part->_maxHealth;
@@ -793,15 +868,75 @@ static void ProcessLimbs(
             if (flesh != flesh) continue;
             if (flesh > maxHp * 3.f) flesh = maxHp;
 
-            int missing = (st == LIMB_STUMP || st == LIMB_CRUSHED
-                        || table == LIMB_STUMP || table == LIMB_CRUSHED) ? 1 : 0;
-
-            if (missing)
+            // ========== CRUSHED / fully missing ==========
+            // Heal overdamage, bud a nub, then form a STUMP (missing → stump).
+            if (eff == LIMB_CRUSHED)
             {
-                float rate = (st == LIMB_CRUSHED || table == LIMB_CRUSHED) ? 0.55f : 1.f;
-                if (worstSev < 0.95f) worstSev = 0.95f;
+                if (worstSev < 1.f) worstSev = 1.f;
+                float rate = 0.50f;
 
-                // A) overdamage (negative) → climb toward 0
+                if (flesh < 0.f)
+                {
+                    float take = -flesh;
+                    float room = budget * rate * g_cfg.overdamageHealMult;
+                    if (take > room) take = room;
+                    if (take > 0.f)
+                    {
+                        part->flesh = flesh + take;
+                        budget -= take / (rate > 0.01f ? rate : 1.f);
+                        hungerCost += take * 1.1f;
+                        anyHeal = 1;
+                        flesh = part->flesh;
+                    }
+                    continue;
+                }
+
+                float formNeed = maxHp * g_cfg.limbStumpFormPct;
+                if (formNeed < 2.f) formNeed = maxHp * 0.12f;
+
+                if (flesh < formNeed && budget > 0.f)
+                {
+                    float need = formNeed - flesh;
+                    float room = budget * rate;
+                    float take = need < room ? need : room;
+                    if (take > 0.f)
+                    {
+                        part->flesh = flesh + take;
+                        budget -= take / (rate > 0.01f ? rate : 1.f);
+                        hungerCost += take * 1.2f;
+                        anyHeal = 1;
+                        flesh = part->flesh;
+                    }
+                }
+
+                // Transition: Missing/Crushed → Stump
+                if (flesh >= formNeed * 0.98f)
+                {
+                    robots->setLimb(kEnum[i], LIMB_STUMP, nullptr);
+                    part = ResolveLimb(med, i);
+                    if (part)
+                    {
+                        // Fresh stump starts with a little bud mass
+                        float nub = maxHp * 0.04f;
+                        if (nub < 1.f) nub = 1.f;
+                        part->flesh = nub;
+                        TF_SEH_TRY { part->updateDerivedHealths(); }
+                        TF_SEH_EXCEPT { }
+                    }
+                    anyHeal = 1;
+                    // Big one-shot food hit + short KO
+                    SpendHungerAndKnockout(med, g_cfg.stumpHungerCost, g_cfg.stumpKoSeconds,
+                        "formed STUMP");
+                    // Don't also apply gradual drain for this transition
+                    continue;
+                }
+            }
+            // ========== STUMP — bud until ready for full limb ==========
+            else if (eff == LIMB_STUMP)
+            {
+                if (worstSev < 0.95f) worstSev = 0.95f;
+                float rate = 1.f;
+
                 if (flesh < 0.f)
                 {
                     float take = -flesh;
@@ -818,8 +953,9 @@ static void ProcessLimbs(
                     continue;
                 }
 
-                // B) bud on stump — flesh only, no updateDerivedHealths
                 float target = maxHp * g_cfg.limbBudThreshold;
+                if (target < 5.f) target = maxHp * 0.40f;
+
                 if (flesh < target && budget > 0.f)
                 {
                     float need = target - flesh;
@@ -835,38 +971,31 @@ static void ProcessLimbs(
                     }
                 }
 
-                // C) restore organic limb once budded enough
-                if (robots && flesh >= maxHp * g_cfg.limbBudThreshold * 0.98f)
+                // Transition: Stump → Restored organic limb (weak)
+                if (flesh >= target * 0.98f)
                 {
                     robots->setLimb(kEnum[i], LIMB_ORIGINAL, nullptr);
-                    // CRITICAL: setLimb invalidates part*
                     part = ResolveLimb(med, i);
-                    if (!part)
+                    if (part)
                     {
-                        anyHeal = 1;
-                        continue;
+                        float start = maxHp * g_cfg.limbRestoredStart;
+                        if (start < 1.f) start = maxHp * 0.18f;
+                        part->flesh = start;
+                        if (part->fleshStun < maxHp * 0.45f)
+                            part->fleshStun = maxHp * 0.45f;
+                        TF_SEH_TRY { part->updateDerivedHealths(); }
+                        TF_SEH_EXCEPT { }
                     }
-                    float start = maxHp * g_cfg.limbRestoredStart;
-                    if (start < 1.f) start = maxHp * 0.18f;
-                    part->flesh = start;
-                    if (part->fleshStun < maxHp * 0.35f)
-                        part->fleshStun = maxHp * 0.35f;
-                    TF_SEH_TRY { part->updateDerivedHealths(); }
-                    TF_SEH_EXCEPT { /* ignore */ }
                     anyHeal = 1;
-                    hungerCost += maxHp * 0.22f;
                     if (worstSev < 0.85f) worstSev = 0.85f;
-                    if (g_cfg.debugLog)
-                    {
-                        char msg[128];
-                        std::snprintf(msg, sizeof(msg),
-                            "ToughnessFeast: restored limb slot %d at %.0f%%",
-                            i, g_cfg.limbRestoredStart * 100.f);
-                        Log(msg);
-                    }
+                    // Massive food cost + longer KO — regrowing a limb is traumatic
+                    SpendHungerAndKnockout(med, g_cfg.restoreHungerCost, g_cfg.restoreKoSeconds,
+                        "RESTORED limb");
+                    continue;
                 }
             }
-            else if (st == LIMB_ORIGINAL || table == LIMB_ORIGINAL)
+            // ========== ORIGINAL weak — strengthen ==========
+            else if (eff == LIMB_ORIGINAL || st == LIMB_ORIGINAL)
             {
                 float pct = flesh / maxHp;
                 if (pct < 0.f) pct = 0.f;
