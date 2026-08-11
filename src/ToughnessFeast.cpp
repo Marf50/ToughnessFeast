@@ -1301,38 +1301,62 @@ static void ApplyWeakLimbPenalty(CharStats* stats, float severity01)
     press(stats->skillMultDodge, g_cfg.weakLimbDodgeMult);
 }
 
+// Kenshi hunger is usually ~0..1 full-bar units, but some paths / displays
+// behave more like large "nutrition" numbers (player reports ~300 full).
+// Always spend as a FRACTION of a sensible full-bar estimate.
+static float HungerFullEstimate(float h)
+{
+    if (h != h || h < 0.f) return 1.f;
+    // Already in 0..1-ish range
+    if (h <= 1.5f) return 1.f;
+    // Slightly over 1 (fed buffer)
+    if (h <= 5.f) return 1.f;
+    // Large scale (nutrition points) — treat ~current if high, else 300 default
+    if (h <= 400.f)
+    {
+        // Full bar is at least max(h, 100), typically ~250-350 when stuffed
+        float full = h;
+        if (full < 250.f) full = 300.f; // empty-ish mid-scale still cost vs 300
+        if (full > 400.f) full = 400.f;
+        return full;
+    }
+    return h; // huge outlier — spend fraction of current
+}
+
 static void SpendHungerAndKnockout(MedicalSystem* med, float hungerFrac, float koSeconds, const char* reason)
 {
     if (!med) return;
     if (hungerFrac < 0.f) hungerFrac = 0.f;
     if (hungerFrac > 0.95f) hungerFrac = 0.95f;
+
     float h = med->hunger;
-    if (h == h && h >= 0.f && h <= 5.f)
+    float spent = 0.f;
+    if (h == h && h >= 0.f && h < 1e6f)
     {
-        h -= hungerFrac;
+        float full = HungerFullEstimate(h);
+        spent = full * hungerFrac;
+        // If value looks 0..1, spend fraction directly (same math)
+        if (h <= 5.f) spent = hungerFrac; // frac of bar where full=1
+        h -= spent;
         if (h < 0.f) h = 0.f;
         med->hunger = h;
     }
-    // Force a real KO so the player feels the transition
+
     if (koSeconds > 0.f)
     {
-        TF_SEH_TRY
-        {
-            med->knockoutForceTimer(koSeconds);
-        }
+        TF_SEH_TRY { med->knockoutForceTimer(koSeconds); }
         TF_SEH_EXCEPT
         {
-            // Fallback: raw timer if call fails
             med->knockoutTimer = koSeconds;
             med->unconcious = true;
         }
     }
     if (g_cfg.debugLog && reason)
     {
-        char msg[160];
+        char msg[192];
         std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: %s  hunger-%.0f%%  KO %.0fs",
-            reason, hungerFrac * 100.f, koSeconds);
+            "ToughnessFeast: %s  spent=%.1f hungerNow=%.1f (cfgFrac=%.0f%%) KO %.0fs",
+            reason, spent, med->hunger, hungerFrac * 100.f, koSeconds);
         Log(msg);
     }
 }
@@ -1609,7 +1633,10 @@ static void ApplyFeastTick(CharStats* stats, float dt)
 
     // Gradual growth needs power + hunger + organic eater.
     // Stage completions (READY stump) always allowed.
-    int allowGrow = (needsFood && power > 0.f && hunger >= g_cfg.minHunger) ? 1 : 0;
+    float fullH = HungerFullEstimate(hunger);
+    float hunger01 = (hunger <= 5.f) ? hunger : (fullH > 0.f ? hunger / fullH : 0.f);
+    if (hunger01 > 1.f) hunger01 = 1.f;
+    int allowGrow = (needsFood && power > 0.f && hunger01 >= g_cfg.minHunger) ? 1 : 0;
     float growPower = allowGrow ? power : 0.f;
 
     // If any stump looks ready, force a process pass with tiny power so restore runs
@@ -1889,10 +1916,18 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
 
     MedicalSystem* med = stats->medical;
     float hungerPct = -1.f;
+    float hungerRaw = -1.f;
     if (med && !med->dead)
     {
         float h = med->hunger;
-        if (h == h && h >= 0.f && h <= 5.f) hungerPct = h * 100.f;
+        if (h == h && h >= 0.f && h < 1e6f)
+        {
+            hungerRaw = h;
+            float full = HungerFullEstimate(h);
+            if (h <= 5.f) hungerPct = h * 100.f; // 0..1 bar
+            else hungerPct = (full > 0.f ? (h / full) * 100.f : 0.f);
+            if (hungerPct > 100.f) hungerPct = 100.f;
+        }
     }
 
     line("== Feast ==", "live");
@@ -1962,15 +1997,19 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
         float drain = g_cfg.hungerDrainPerSec * power * 100.f;
         std::snprintf(r, sizeof(r), "ON pwr %.2f", power);
         line("Feast", r);
-        std::snprintf(r, sizeof(r), "~%.1f%%/s heal", drain);
-        line("Food use", r);
+        std::snprintf(r, sizeof(r), "stump -%.0f%%  limb -%.0f%%",
+            g_cfg.stumpHungerCost * 100.f, g_cfg.restoreHungerCost * 100.f);
+        line("Stage food", r);
     }
 
     if (hungerPct >= 0.f)
     {
-        char r[40];
+        char r[48];
         int ok = hungerPct >= g_cfg.minHunger * 100.f ? 1 : 0;
-        std::snprintf(r, sizeof(r), "%.0f%% %s", hungerPct, ok ? "fed" : "TOO LOW");
+        if (hungerRaw > 5.f)
+            std::snprintf(r, sizeof(r), "%.0f (%.0f%%) %s", hungerRaw, hungerPct, ok ? "fed" : "LOW");
+        else
+            std::snprintf(r, sizeof(r), "%.0f%% %s", hungerPct, ok ? "fed" : "TOO LOW");
         line("Hunger", r);
     }
 
