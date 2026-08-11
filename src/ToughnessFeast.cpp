@@ -46,7 +46,7 @@ static int tf_strncpy_s(char* dest, size_t destsz, const char* src, size_t)
 struct Config
 {
     float combatCapToughness;
-    float foodRegenStart;
+    float foodRegenStart;       // human / default unlock
     float foodRegenStartShek;
     float foodRegenStartHiver;
     float foodRegenScalePerPoint;
@@ -56,26 +56,40 @@ struct Config
     float hungerDrainPerSecond;
     float minHungerToRegen;
     int healUnhealable;
-    float limbRegrowPerSecond;
-    float limbRestoreFleshPct;
+    float limbRegrowPerSecond;      // VERY slow stump rebuild
+    float limbBudThreshold;         // stump flesh % before setLimb
+    float limbRestoredStartPct;     // flesh % right after setLimb (weak limb)
+    float limbStrongPct;            // considered "mostly recovered"
     float past100XpMult;
     int debugLog;
     int useRaceHeuristics;
-    int enableHooks; // 0 = load-only (safe), 1 = install gameplay hooks
-    int enableMedicalHooks; // 0 = skip medicalUpdate (world load safer)
-    int enableAnatomyPass; // 0 = only direct limb pointers (safer)
+    int enableHooks;
+    int enableMedicalHooks;         // food/limb regen (not medicalUpdate hook)
+    int enableLimbRestore;          // setLimb staged restore
 };
 
 static Config g_cfg = {
-    100.f, 75.f, 50.f, 0.f,
-    0.04f, 0.012f,
-    2.5f, 1.5f, 0.012f, 0.10f,
-    1, 3.0f, 0.85f, 0.18f,
-    1,  // debugLog
-    1,  // useRaceHeuristics
-    1,  // enableHooks
-    1,  // enableMedicalHooks
-    0   // enableAnatomyPass default OFF (getPart was crash-risk)
+    100.f,   // combatCap
+    75.f,    // human start
+    50.f,    // shek
+    0.f,     // hiver
+    0.04f,   // scale
+    0.012f,  // hiver scale
+    1.2f,    // flesh heal /s (normal wounds)
+    0.8f,    // stun heal /s
+    0.015f,  // hunger drain base
+    0.12f,   // min hunger
+    1,       // heal unhealable
+    0.09f,   // limb regrow /s at power 1 — full stump ~15–40+ min
+    0.38f,   // bud threshold 38% before restore
+    0.16f,   // spawn restored limb at 16% HP (fragile)
+    0.72f,   // strong at 72%
+    0.18f,   // past 100 xp
+    1,       // debugLog
+    1,       // race heuristics
+    1,       // enableHooks
+    1,       // enableMedicalHooks
+    1        // enableLimbRestore
 };
 
 static char g_pluginDir[MAX_PATH] = { 0 };
@@ -151,7 +165,7 @@ static void LoadConfig()
         char* val = TrimInPlace(eq + 1);
         if (std::strcmp(key, "EnableHooks") == 0) g_cfg.enableHooks = ParseBoolC(val);
         else if (std::strcmp(key, "EnableMedicalHooks") == 0) g_cfg.enableMedicalHooks = ParseBoolC(val);
-        else if (std::strcmp(key, "EnableAnatomyPass") == 0) g_cfg.enableAnatomyPass = ParseBoolC(val);
+        else if (std::strcmp(key, "EnableAnatomyPass") == 0) { /* deprecated */ }
         else if (std::strcmp(key, "CombatCapToughness") == 0) g_cfg.combatCapToughness = (float)std::atof(val);
         else if (std::strcmp(key, "FoodRegenStartHuman") == 0 || std::strcmp(key, "FoodRegenStartOther") == 0
               || std::strcmp(key, "FoodRegenStartToughness") == 0)
@@ -166,7 +180,15 @@ static void LoadConfig()
         else if (std::strcmp(key, "MinHungerToRegen") == 0) g_cfg.minHungerToRegen = (float)std::atof(val);
         else if (std::strcmp(key, "HealUnhealableWounds") == 0) g_cfg.healUnhealable = ParseBoolC(val);
         else if (std::strcmp(key, "LimbRegrowPerSecond") == 0) g_cfg.limbRegrowPerSecond = (float)std::atof(val);
-        else if (std::strcmp(key, "LimbRestoreFleshPercent") == 0) g_cfg.limbRestoreFleshPct = (float)std::atof(val);
+        else if (std::strcmp(key, "LimbRestoreFleshPercent") == 0) g_cfg.limbBudThreshold = (float)std::atof(val);
+        
+        else if (std::strcmp(key, "LimbRegrowPerSecond") == 0) g_cfg.limbRegrowPerSecond = (float)std::atof(val);
+        else if (std::strcmp(key, "LimbBudThreshold") == 0) g_cfg.limbBudThreshold = (float)std::atof(val);
+        else if (std::strcmp(key, "LimbRestoredStartPct") == 0) g_cfg.limbRestoredStartPct = (float)std::atof(val);
+        else if (std::strcmp(key, "LimbStrongPct") == 0) g_cfg.limbStrongPct = (float)std::atof(val);
+        else if (std::strcmp(key, "EnableLimbRestore") == 0) g_cfg.enableLimbRestore = ParseBoolC(val);
+        else if (std::strcmp(key, "EnableMedicalHooks") == 0) g_cfg.enableMedicalHooks = ParseBoolC(val);
+        else if (std::strcmp(key, "EnableAnatomyPass") == 0) { /* deprecated */ }
         else if (std::strcmp(key, "Past100XpMult") == 0) g_cfg.past100XpMult = (float)std::atof(val);
         else if (std::strcmp(key, "DebugLog") == 0) g_cfg.debugLog = ParseBoolC(val);
         else if (std::strcmp(key, "UseRaceHeuristics") == 0) g_cfg.useRaceHeuristics = ParseBoolC(val);
@@ -176,23 +198,239 @@ static void LoadConfig()
 
 // ---------- gameplay (only used if EnableHooks=1) ----------
 //
-// CRITICAL: Do NOT hook MedicalSystem::medicalUpdate for regen.
-// Calling getPart/setLimb/fields from inside medicalUpdate re-enters the
-// medical system and/or hits wrong layout offsets → crash on world load.
-//
-// Regen runs from CharStats hooks (already proven stable) using:
-//   stats->medical, stats->me, getPartCount/getPart methods (game code paths)
+// Never hook MedicalSystem::medicalUpdate — that path crashed.
+// Regen + staged limb restore run from CharStats hooks (stable).
 
-static float RegenPowerFromToughness(float toughness)
+static float FoodRegenStartFor(CharStats* stats)
 {
-    float excess = toughness - g_cfg.foodRegenStart;
+    if (!g_cfg.useRaceHeuristics) return g_cfg.foodRegenStart;
+    Character* me = stats ? stats->me : nullptr;
+    RaceData* race = me ? me->getRace() : nullptr;
+    if (!race || race->robot) return g_cfg.foodRegenStart;
+    if (race->gigantic) return g_cfg.foodRegenStartShek;
+    if (race->hungerRate > 1.15f) return g_cfg.foodRegenStartHiver;
+    return g_cfg.foodRegenStart;
+}
+
+static float FoodRegenScaleFor(CharStats* stats)
+{
+    if (!g_cfg.useRaceHeuristics) return g_cfg.foodRegenScalePerPoint;
+    Character* me = stats ? stats->me : nullptr;
+    RaceData* race = me ? me->getRace() : nullptr;
+    if (race && !race->robot && !race->gigantic && race->hungerRate > 1.15f)
+        return g_cfg.foodRegenScaleHiver;
+    return g_cfg.foodRegenScalePerPoint;
+}
+
+static float RegenPowerFromStats(CharStats* stats)
+{
+    if (!stats) return 0.f;
+    float tough = stats->_toughness;
+    if (tough < 0.f || tough > 500.f) return 0.f;
+    float excess = tough - FoodRegenStartFor(stats);
     if (excess <= 0.f) return 0.f;
-    float power = excess * g_cfg.foodRegenScalePerPoint;
-    if (power > 4.f) power = 4.f;
+    float power = excess * FoodRegenScaleFor(stats);
+    if (power > 3.5f) power = 3.5f;
     return power;
 }
 
-// Throttle: CharStats hooks can fire often; accumulate simple per-stats token
+// Combat feedback while a natural limb is regrowing / weak:
+// scale game injury-facing multipliers on CharStats (reapplied each tick).
+static void ApplyRegrowthCombatPenalty(CharStats* stats, float severity01)
+{
+    if (!stats) return;
+    if (severity01 < 0.f) severity01 = 0.f;
+    if (severity01 > 1.f) severity01 = 1.f;
+    // Keep some fight left in them — never zero out completely
+    float dmgMul = 1.f - 0.55f * severity01;   // up to -55% damage mult
+    float dexMul = 1.f - 0.45f * severity01;   // up to -45% dex
+    float spdMul = 1.f - 0.35f * severity01;   // up to -35% combat speed
+    float dodgeMul = 1.f - 0.40f * severity01;
+
+    if (stats->skillMultDamage > 0.05f)
+        stats->skillMultDamage *= dmgMul;
+    if (stats->skillMultDexterity > 0.05f)
+        stats->skillMultDexterity *= dexMul;
+    if (stats->combatSpeedMultiplier > 0.05f)
+        stats->combatSpeedMultiplier *= spdMul;
+    if (stats->skillMultDodge > 0.05f)
+        stats->skillMultDodge *= dodgeMul;
+}
+
+// Stages (per limb, driven by LimbState + flesh%):
+//  0 MISSING  — STUMP / CRUSHED: slowly bud flesh on the stump (very slow)
+//  1 BUDDING  — still stump, flesh climbing toward LimbBudThreshold
+//  2 RESTORED_WEAK — setLimb(ORIGINAL), flesh forced to LimbRestoredStartPct
+//  3 STRENGTHENING — flesh < LimbStrongPct, fights poorly (game injury + our mults)
+//  4 HEALTHY  — flesh >= LimbStrongPct, no extra penalty
+//
+// Combat ability follows flesh% after restore (and missing limbs while stump).
+
+static void ProcessLimbRegrowth(
+    MedicalSystem* med,
+    CharStats* stats,
+    float power,
+    float frameTime,
+    float& hungerCost,
+    int& anyHeal,
+    float& worstSeverity) // 0 healthy .. 1 catastrophic
+{
+    if (!med || !stats || !g_cfg.enableLimbRestore) return;
+    if (power <= 0.f) return;
+
+    RobotLimbs* robots = med->robotLimbs;
+    if (!robots) return;
+
+    // Order matches RobotLimbs::Limb enum
+    static const RobotLimbs::Limb kLimbs[4] = {
+        RobotLimbs::LEFT_ARM,
+        RobotLimbs::RIGHT_ARM,
+        RobotLimbs::LEFT_LEG,
+        RobotLimbs::RIGHT_LEG
+    };
+
+    float regrowBudget = g_cfg.limbRegrowPerSecond * power * frameTime;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        RobotLimbs::Limb limbEnum = kLimbs[i];
+        MedicalSystem::HealthPartStatus* part = med->getPart(limbEnum);
+        if (!part) continue;
+        if (part->isRobotic()) continue; // never touch prosthetics
+
+        LimbState state = part->getRobotLimbState();
+        // Cross-check robotLimbs table when available
+        LimbState tableState = robots->getState(limbEnum);
+        if (tableState == LIMB_REPLACED) continue;
+        if (state == LIMB_REPLACED) continue;
+
+        float maxHp = part->maxHealth();
+        if (maxHp < 1.f) maxHp = part->_maxHealth;
+        if (maxHp < 1.f || maxHp > 10000.f) continue;
+
+        float flesh = part->flesh;
+        if (flesh != flesh) continue; // NaN
+        if (flesh > maxHp * 3.f) flesh = maxHp;
+
+        int missing = (state == LIMB_STUMP || state == LIMB_CRUSHED
+                    || tableState == LIMB_STUMP || tableState == LIMB_CRUSHED) ? 1 : 0;
+
+        if (missing)
+        {
+            // Stage 0–1: budding on stump/crush. Crushed is slower.
+            float rate = (state == LIMB_CRUSHED || tableState == LIMB_CRUSHED) ? 0.55f : 1.f;
+            // Severity: full penalty while missing
+            if (worstSeverity < 0.95f) worstSeverity = 0.95f;
+
+            if (regrowBudget > 0.f)
+            {
+                // Treat negative/overdamage flesh as 0 for budding
+                if (flesh < 0.f) flesh = 0.f;
+                float target = maxHp * g_cfg.limbBudThreshold;
+                if (target < 5.f) target = maxHp * 0.38f;
+
+                if (flesh < target)
+                {
+                    float need = target - flesh;
+                    float take = need;
+                    float room = regrowBudget * rate;
+                    if (take > room) take = room;
+                    if (take > 0.f)
+                    {
+                        part->flesh = flesh + take;
+                        regrowBudget -= take / (rate > 0.01f ? rate : 1.f);
+                        hungerCost += take * 1.1f; // hungry work
+                        anyHeal = 1;
+                        flesh = part->flesh;
+                    }
+                }
+
+                // Stage 2 trigger: enough bud mass → restore organic limb weak
+                if (flesh >= maxHp * g_cfg.limbBudThreshold * 0.98f)
+                {
+                    robots->setLimb(limbEnum, LIMB_ORIGINAL, nullptr);
+                    float start = maxHp * g_cfg.limbRestoredStartPct;
+                    if (start < 1.f) start = maxHp * 0.16f;
+                    part->flesh = start;
+                    // heavy stun — useless in a fight for a bit
+                    part->fleshStun = maxHp * 0.55f;
+                    part->updateDerivedHealths();
+                    anyHeal = 1;
+                    hungerCost += maxHp * 0.25f;
+                    if (worstSeverity < 0.85f) worstSeverity = 0.85f;
+
+                    if (g_cfg.debugLog)
+                    {
+                        char msg[160];
+                        std::snprintf(msg, sizeof(msg),
+                            "ToughnessFeast: limb RESTORED weak (slot %d) flesh=%.0f/%.0f",
+                            i, start, maxHp);
+                        DebugLog(msg);
+                    }
+                }
+                else if (g_cfg.debugLog && flesh > 1.f)
+                {
+                    // occasional bud progress (throttle by flesh crossing 10% steps)
+                    int step = (int)(flesh / maxHp * 10.f);
+                    static int s_lastStep[4] = { -1, -1, -1, -1 };
+                    if (step != s_lastStep[i])
+                    {
+                        s_lastStep[i] = step;
+                        char msg[160];
+                        std::snprintf(msg, sizeof(msg),
+                            "ToughnessFeast: limb BUDDING slot %d %.0f%% (need %.0f%%)",
+                            i, flesh / maxHp * 100.f, g_cfg.limbBudThreshold * 100.f);
+                        DebugLog(msg);
+                    }
+                }
+            }
+        }
+        else if (state == LIMB_ORIGINAL || tableState == LIMB_ORIGINAL)
+        {
+            // Stage 3–4: organic limb present — strengthen slowly if weak
+            float pct = (maxHp > 0.f) ? (flesh / maxHp) : 1.f;
+            if (pct < 0.f) pct = 0.f;
+
+            if (pct < g_cfg.limbStrongPct)
+            {
+                // Combat severity from how weak the limb still is
+                float sev = 1.f - (pct / (g_cfg.limbStrongPct > 0.1f ? g_cfg.limbStrongPct : 0.72f));
+                if (sev > worstSeverity) worstSeverity = sev;
+
+                // Prefer dedicated slow regrow budget for weak restored limbs
+                if (regrowBudget > 0.f && flesh < maxHp)
+                {
+                    float need = maxHp - flesh;
+                    // even slower after restore (consolidation)
+                    float take = need;
+                    float room = regrowBudget * 0.65f;
+                    if (take > room) take = room;
+                    if (take > 0.f)
+                    {
+                        part->flesh = flesh + take;
+                        regrowBudget -= take / 0.65f;
+                        hungerCost += take * 0.35f;
+                        anyHeal = 1;
+                        // clear stun gradually
+                        if (part->fleshStun > 0.f)
+                        {
+                            float st = part->fleshStun;
+                            float stTake = take * 0.8f;
+                            if (stTake > st) stTake = st;
+                            part->fleshStun -= stTake;
+                        }
+                        part->updateDerivedHealths();
+                    }
+                }
+            }
+            else
+            {
+                // healthy limb — no severity from this part
+            }
+        }
+    }
+}
+
 static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
 {
     if (!g_cfg.enableMedicalHooks) return;
@@ -200,23 +438,17 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
     if (frameTime <= 0.f) return;
     if (frameTime > 0.25f) frameTime = 0.25f;
 
-    float tough = stats->_toughness;
-    if (tough < 0.f || tough > 500.f) return;
-
-    float power = RegenPowerFromToughness(tough);
+    float power = RegenPowerFromStats(stats);
     if (power <= 0.f) return;
 
     MedicalSystem* med = stats->medical;
     if (!med) return;
+    if (med->dead) return;
 
     Character* me = stats->me;
     if (!me) return;
+    if (!me->amSomeoneWhoNeedsToEatToLive()) return;
 
-    // Game methods — correct layout handled inside kenshi.exe
-    if (!me->amSomeoneWhoNeedsToEatToLive())
-        return;
-
-    // Hunger via field; if layout is wrong this is still a risk, so range-check hard
     float hunger = med->hunger;
     if (hunger < g_cfg.minHungerToRegen) return;
     if (hunger < 0.f || hunger > 5.f) return;
@@ -225,28 +457,33 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
     float stunBudget = g_cfg.stunHealPerSecond * power * frameTime;
     float hungerCost = 0.f;
     int anyHeal = 0;
+    float worstSeverity = 0.f;
 
+    // --- staged limb restore (slow) ---
+    ProcessLimbRegrowth(med, stats, power, frameTime, hungerCost, anyHeal, worstSeverity);
+
+    // --- general flesh wounds (non-limb / residual) via getPart index ---
     int count = med->getPartCount();
-    if (count < 0 || count > 32) return;
+    if (count < 0) count = 0;
+    if (count > 32) count = 32;
 
     for (int i = 0; i < count; ++i)
     {
         MedicalSystem::HealthPartStatus* part = med->getPart((unsigned long long)i);
         if (!part) continue;
         if (part->isRobotic()) continue;
-        // Do not skip isDead for low flesh — stumps often read as dead
-        // but avoid heavy method use: only heal if flesh below max via POD
 
-        float maxHp = part->_maxHealth;
-        if (maxHp < 1.f || maxHp > 10000.f)
-        {
-            // fallback to method
-            maxHp = part->maxHealth();
-            if (maxHp < 1.f || maxHp > 10000.f) continue;
-        }
+        LimbState ls = part->getRobotLimbState();
+        // Stumps handled in ProcessLimbRegrowth
+        if (ls == LIMB_STUMP || ls == LIMB_CRUSHED || ls == LIMB_REPLACED)
+            continue;
+
+        float maxHp = part->maxHealth();
+        if (maxHp < 1.f) maxHp = part->_maxHealth;
+        if (maxHp < 1.f || maxHp > 10000.f) continue;
 
         float flesh = part->flesh;
-        if (flesh != flesh) continue; // NaN
+        if (flesh != flesh) continue;
         if (flesh > maxHp * 3.f) continue;
 
         if (part->fleshStun > 0.f && stunBudget > 0.f)
@@ -257,7 +494,7 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
                 if (st > stunBudget) st = stunBudget;
                 part->fleshStun -= st;
                 stunBudget -= st;
-                hungerCost += st * 0.1f;
+                hungerCost += st * 0.08f;
                 anyHeal = 1;
             }
         }
@@ -266,23 +503,27 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
         {
             int isOver = (flesh < 0.f) ? 1 : 0;
             if (isOver && !g_cfg.healUnhealable) continue;
-            float rate = isOver ? 0.4f : 1.f;
-            float need = isOver ? (-flesh + 1.f) : (maxHp - flesh);
+            float rate = isOver ? 0.35f : 1.f;
+            float need = isOver ? (-flesh + 0.5f) : (maxHp - flesh);
             if (need <= 0.f) continue;
-            float take = need;
             float room = fleshBudget * rate;
+            float take = need;
             if (take > room) take = room;
             part->flesh = flesh + take;
             fleshBudget -= take / (rate > 0.01f ? rate : 1.f);
-            hungerCost += take * (isOver ? 0.45f : 0.2f);
+            hungerCost += take * (isOver ? 0.4f : 0.15f);
             anyHeal = 1;
         }
     }
 
+    // Combat integration: while any limb is missing/weak, fight worse
+    if (worstSeverity > 0.05f)
+        ApplyRegrowthCombatPenalty(stats, worstSeverity);
+
     if (anyHeal && hungerCost > 0.f)
     {
         float drain = g_cfg.hungerDrainPerSecond * power * frameTime;
-        drain += hungerCost * 0.001f;
+        drain += hungerCost * 0.0012f;
         float next = hunger - drain;
         if (next < 0.f) next = 0.f;
         if (next <= 5.f)
@@ -290,11 +531,17 @@ static void ApplyFoodRegenFromStats(CharStats* stats, float frameTime)
 
         if (g_cfg.debugLog)
         {
-            char msg[128];
+            char msg[160];
             std::snprintf(msg, sizeof(msg),
-                "ToughnessFeast: regen t=%.1f p=%.2f h=%.3f", tough, power, next);
+                "ToughnessFeast: regen t=%.1f p=%.2f h=%.3f sev=%.2f",
+                stats->_toughness, power, next, worstSeverity);
             DebugLog(msg);
         }
+    }
+    else if (worstSeverity > 0.05f)
+    {
+        // Still apply combat penalty even if no heal this tick (starving / slow)
+        ApplyRegrowthCombatPenalty(stats, worstSeverity);
     }
 }
 
@@ -312,7 +559,6 @@ static float calculateToughnessDamageResistanceMult_hook(CharStats* self)
         self->_toughness = g_cfg.combatCapToughness;
     float r = calculateToughnessDamageResistanceMult_orig(self);
     self->_toughness = saved;
-    // Tiny regen opportunity when DR is evaluated (combat)
     if (g_cfg.enableMedicalHooks)
         ApplyFoodRegenFromStats(self, 0.02f);
     return r;
@@ -328,7 +574,6 @@ static float calculateToughnessWoundDegenerationRate_hook(CharStats* self)
         self->_toughness = g_cfg.combatCapToughness;
     float r = calculateToughnessWoundDegenerationRate_orig(self);
     self->_toughness = saved;
-    // Main regen tick — wound degen is consulted regularly for injured chars
     if (g_cfg.enableMedicalHooks)
         ApplyFoodRegenFromStats(self, 0.05f);
     return r;
@@ -376,7 +621,6 @@ static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
         float mult = g_cfg.past100XpMult / (1.f + over * 0.02f);
         self->_toughness = before + 0.002f * mult;
     }
-    // Slow out-of-combat regen tick on toughness time XP
     if (g_cfg.enableMedicalHooks)
         ApplyFoodRegenFromStats(self, 0.1f);
 }
@@ -491,7 +735,7 @@ static void InstallHooks()
     // Intentionally NOT hooking medicalUpdate (re-entrancy / layout crashes).
     // Regen is applied from CharStats DR / wound-degen / XP-time hooks instead.
     if (g_cfg.enableMedicalHooks)
-        DebugLog("ToughnessFeast: food regen ON via CharStats hooks (no medicalUpdate hook)");
+        DebugLog("ToughnessFeast: food regen + staged limb restore ON (no medicalUpdate hook)");
     else
         DebugLog("ToughnessFeast: food regen OFF (EnableMedicalHooks=0)");
 }
@@ -517,5 +761,5 @@ TF_EXPORT void startPlugin()
     }
 
     InstallHooks();
-    DebugLog("ToughnessFeast: ready (no medicalUpdate hook; regen via CharStats)");
+    DebugLog("ToughnessFeast: ready (staged limb restore via CharStats)");
 }
