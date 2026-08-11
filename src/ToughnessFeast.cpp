@@ -25,16 +25,6 @@
 #include <kenshi/MedicalSystem.h>
 #include <kenshi/Enums.h>
 #include <kenshi/RaceData.h>
-#include <kenshi/Globals.h>
-#include <kenshi/GameWorld.h>
-#include <kenshi/PlayerInterface.h>
-#include <kenshi/util/hand.h>
-#include <mygui/MyGUI_Gui.h>
-#include <mygui/MyGUI_Window.h>
-#include <mygui/MyGUI_TextBox.h>
-#include <mygui/MyGUI_EditBox.h>
-#include <mygui/MyGUI_Widget.h>
-#include <mygui/MyGUI_UString.h>
 #endif
 
 #include <cstdint>
@@ -107,7 +97,7 @@ static Config g_cfg = {
     1,       // enableHooks
     1,       // enableMedicalHooks
     1,       // enableLimbRestore
-    1        // showStatusHud
+    0        // showStatusHud OFF — MyGUI crashed on save load
 };
 
 static char g_pluginDir[MAX_PATH] = { 0 };
@@ -217,19 +207,13 @@ static void LoadConfig()
 
 
 // ---------------------------------------------------------------------------
-// Status HUD (MyGUI) — own widgets, no game tooltip std::string ABI
-// Shows limb stage progress, regen power, hunger, toughness soft-cap info
+// Status readout — LOG ONLY (MyGUI HUD crashed on save load / hung on title)
+// Progress still visible in RE_Kenshi log when DebugLog=1
 // ---------------------------------------------------------------------------
 
-static char g_statusText[2048] = "ToughnessFeast\n(waiting for character...)";
+static char g_statusText[2048] = "ToughnessFeast";
 static CharStats* g_lastStats = nullptr;
-
-#if !defined(TOUGHNESSFEAST_LINUX_IDE)
-static MyGUI::Window* g_hudWindow = nullptr;
-static MyGUI::TextBox* g_hudText = nullptr;
-static int g_hudIsEdit = 0;
-static int g_hudCreateAttempts = 0;
-#endif
+static int g_statusLogCooldown = 0;
 
 static const char* LimbSlotName(int i)
 {
@@ -237,68 +221,44 @@ static const char* LimbSlotName(int i)
     return (i >= 0 && i < 4) ? n[i] : "?";
 }
 
-// Build multi-line status for a character into g_statusText
 static void BuildStatusText(CharStats* stats)
 {
     if (!stats)
     {
-        std::snprintf(g_statusText, sizeof(g_statusText),
-            "ToughnessFeast\n(no character)");
+        std::snprintf(g_statusText, sizeof(g_statusText), "ToughnessFeast (no character)");
         return;
     }
 
     float tough = stats->_toughness;
-    float power = 0.f;
     float start = g_cfg.foodRegenStart;
-    // local copies of helpers exist later — recompute simply here
+    float power = 0.f;
+    Character* me = stats->me;
+    RaceData* race = (me && g_cfg.useRaceHeuristics) ? me->getRace() : nullptr;
+    if (race && !race->robot)
     {
-        Character* me = stats->me;
-        RaceData* race = me ? me->getRace() : nullptr;
-        if (g_cfg.useRaceHeuristics && race && !race->robot)
-        {
-            if (race->gigantic) start = g_cfg.foodRegenStartShek;
-            else if (race->hungerRate > 1.15f) start = g_cfg.foodRegenStartHiver;
-        }
-        float excess = tough - start;
-        if (excess > 0.f)
-        {
-            float scale = g_cfg.foodRegenScalePerPoint;
-            if (g_cfg.useRaceHeuristics && race && !race->robot && !race->gigantic && race->hungerRate > 1.15f)
-                scale = g_cfg.foodRegenScaleHiver;
-            power = excess * scale;
-            if (power > 3.5f) power = 3.5f;
-        }
+        if (race->gigantic) start = g_cfg.foodRegenStartShek;
+        else if (race->hungerRate > 1.15f) start = g_cfg.foodRegenStartHiver;
+    }
+    float excess = tough - start;
+    if (excess > 0.f)
+    {
+        float scale = g_cfg.foodRegenScalePerPoint;
+        if (race && !race->robot && !race->gigantic && race->hungerRate > 1.15f)
+            scale = g_cfg.foodRegenScaleHiver;
+        power = excess * scale;
+        if (power > 3.5f) power = 3.5f;
     }
 
     MedicalSystem* med = stats->medical;
-    float hunger = med ? med->hunger : -1.f;
-    int fed = (hunger >= g_cfg.minHungerToRegen) ? 1 : 0;
+    float hunger = (med && med->hunger >= 0.f && med->hunger <= 5.f) ? med->hunger : -1.f;
 
     char lines[1800];
-    lines[0] = 0;
     int off = 0;
-    #define APP(...) do { \
-        int _n = std::snprintf(lines + off, sizeof(lines) - (size_t)off, __VA_ARGS__); \
-        if (_n > 0) off += _n; \
-        if (off < 0 || off >= (int)sizeof(lines)) off = (int)sizeof(lines) - 1; \
-    } while (0)
+    #define APP(...) do { int _n = std::snprintf(lines + off, sizeof(lines) - (size_t)off, __VA_ARGS__); if (_n > 0) off += _n; if (off >= (int)sizeof(lines)) off = (int)sizeof(lines) - 1; } while (0)
 
-    APP("=== Toughness Feast ===\n");
-    APP("Toughness: %.1f  (combat cap %.0f)\n", tough, g_cfg.combatCapToughness);
-    APP("Food regen unlock: %.0f   power: %.2f\n", start, power);
+    APP("TF t=%.1f unlock=%.0f p=%.2f", tough, start, power);
     if (hunger >= 0.f)
-        APP("Hunger: %.0f%%  %s\n", hunger * 100.f, fed ? "FED" : "TOO HUNGRY");
-    else
-        APP("Hunger: ?\n");
-
-    if (power <= 0.f)
-        APP("Status: below unlock — no food regen yet\n");
-    else if (!fed)
-        APP("Status: need food for regen/regrow\n");
-    else
-        APP("Status: regenerating\n");
-
-    APP("-- Limbs --\n");
+        APP(" h=%.0f%%", hunger * 100.f);
 
     if (med && med->robotLimbs)
     {
@@ -309,209 +269,45 @@ static void BuildStatusText(CharStats* stats)
         for (int i = 0; i < 4; ++i)
         {
             MedicalSystem::HealthPartStatus* part = med->getPart(kLimbs[i]);
-            if (!part)
-            {
-                APP("%s: (none)\n", LimbSlotName(i));
-                continue;
-            }
-            if (part->isRobotic())
-            {
-                APP("%s: prosthetic\n", LimbSlotName(i));
-                continue;
-            }
-
+            if (!part || part->isRobotic()) continue;
             LimbState st = part->getRobotLimbState();
             float maxHp = part->maxHealth();
             if (maxHp < 1.f) maxHp = part->_maxHealth;
-            if (maxHp < 1.f) maxHp = 100.f;
+            if (maxHp < 1.f) continue;
             float flesh = part->flesh;
             if (flesh < 0.f) flesh = 0.f;
             float pct = flesh / maxHp;
-            if (pct > 1.5f) pct = 1.5f;
 
-            if (st == LIMB_REPLACED)
+            if (st == LIMB_STUMP || st == LIMB_CRUSHED)
             {
-                APP("%s: prosthetic/replaced\n", LimbSlotName(i));
-            }
-            else if (st == LIMB_STUMP || st == LIMB_CRUSHED)
-            {
-                float prog = 0.f;
-                if (g_cfg.limbBudThreshold > 0.01f)
-                    prog = (pct / g_cfg.limbBudThreshold) * 100.f;
+                float prog = (g_cfg.limbBudThreshold > 0.01f) ? (pct / g_cfg.limbBudThreshold) * 100.f : 0.f;
                 if (prog > 100.f) prog = 100.f;
-                if (prog < 0.f) prog = 0.f;
-                APP("%s: %s  bud %.0f%% -> restore@%.0f%%\n",
-                    LimbSlotName(i),
-                    st == LIMB_CRUSHED ? "CRUSHED" : "STUMP",
-                    prog, g_cfg.limbBudThreshold * 100.f);
-                // simple bar
-                int bars = (int)(prog / 10.f);
-                if (bars < 0) bars = 0;
-                if (bars > 10) bars = 10;
-                char bar[12];
-                for (int b = 0; b < 10; ++b) bar[b] = (b < bars) ? '#' : '.';
-                bar[10] = 0;
-                APP("        [%s] next: weak limb\n", bar);
+                APP(" | %s BUD%.0f%%", LimbSlotName(i), prog);
             }
-            else // ORIGINAL
+            else if (st == LIMB_ORIGINAL && pct < g_cfg.limbStrongPct)
             {
-                if (pct < g_cfg.limbStrongPct)
-                {
-                    float lo = g_cfg.limbRestoredStartPct;
-                    float hi = g_cfg.limbStrongPct;
-                    float prog = 0.f;
-                    if (hi > lo)
-                        prog = ((pct - lo) / (hi - lo)) * 100.f;
-                    if (prog < 0.f) prog = 0.f;
-                    if (prog > 100.f) prog = 100.f;
-                    APP("%s: WEAK  HP %.0f%%  -> strong@%.0f%%\n",
-                        LimbSlotName(i), pct * 100.f, hi * 100.f);
-                    int bars = (int)(prog / 10.f);
-                    if (bars > 10) bars = 10;
-                    char bar[12];
-                    for (int b = 0; b < 10; ++b) bar[b] = (b < bars) ? '#' : '.';
-                    bar[10] = 0;
-                    APP("        [%s] fight penalty active\n", bar);
-                }
-                else
-                {
-                    APP("%s: OK  HP %.0f%%\n", LimbSlotName(i), pct * 100.f);
-                }
+                APP(" | %s WEAK%.0f%%", LimbSlotName(i), pct * 100.f);
             }
         }
     }
-    else
-    {
-        APP("(limb data unavailable)\n");
-    }
-
-    APP("--------------\n");
-    APP("DR/degen softcap @%.0f | XP past 100 on\n", g_cfg.combatCapToughness);
-
     #undef APP
     std::snprintf(g_statusText, sizeof(g_statusText), "%s", lines);
 }
 
-static CharStats* TryGetSelectedStats()
-{
-#if defined(TOUGHNESSFEAST_LINUX_IDE)
-    return g_lastStats;
-#else
-    if (!ou || !ou->player) return g_lastStats;
-    Character* c = ou->player->selectedCharacter.getCharacter();
-    if (!c) return g_lastStats;
-    if (c->stats) return c->stats;
-    return c->getStats();
-#endif
-}
-
-static void CreateStatusHudForced()
-{
-#if defined(TOUGHNESSFEAST_LINUX_IDE)
-    return;
-#else
-    if (!g_cfg.showStatusHud) return;
-    if (g_hudWindow) return;
-    if (g_hudCreateAttempts > 60) return;
-    ++g_hudCreateAttempts;
-
-    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
-    if (!gui)
-    {
-        if (g_hudCreateAttempts == 1 || (g_hudCreateAttempts % 20) == 0)
-            DebugLog("ToughnessFeast: MyGUI not ready yet");
-        return;
-    }
-
-    // Match KillButton: layer "Window", skin Kenshi_WindowCX
-    g_hudWindow = gui->createWidgetReal<MyGUI::Window>(
-        "Kenshi_WindowCX",
-        0.70f, 0.08f, 0.28f, 0.42f,
-        MyGUI::Align::Default,
-        "Window",
-        "ToughnessFeastHud");
-
-    if (!g_hudWindow)
-    {
-        ErrorLog("ToughnessFeast: failed to create HUD window");
-        return;
-    }
-
-    g_hudWindow->setCaption("Toughness Feast");
-    g_hudWindow->setVisible(true);
-    g_hudWindow->setEnabled(true);
-
-    MyGUI::Widget* client = g_hudWindow->getClientWidget();
-    if (!client)
-        client = g_hudWindow;
-
-    MyGUI::EditBox* edit = nullptr;
-    edit = client->createWidgetReal<MyGUI::EditBox>(
-        "EditBox",
-        0.03f, 0.03f, 0.94f, 0.94f,
-        MyGUI::Align::Stretch,
-        "TfHudEdit");
-
-    if (edit)
-    {
-        edit->setEditReadOnly(true);
-        edit->setEditMultiLine(true);
-        edit->setEditWordWrap(true);
-        edit->setVisible(true);
-        edit->setCaption(g_statusText);
-        g_hudText = reinterpret_cast<MyGUI::TextBox*>(edit);
-        g_hudIsEdit = 1;
-    }
-    else
-    {
-        g_hudText = client->createWidgetReal<MyGUI::TextBox>(
-            "TextBox",
-            0.03f, 0.03f, 0.94f, 0.94f,
-            MyGUI::Align::Stretch,
-            "TfHudText");
-        if (g_hudText)
-        {
-            g_hudText->setVisible(true);
-            g_hudText->setCaption(g_statusText);
-            g_hudIsEdit = 0;
-        }
-    }
-
-    DebugLog("ToughnessFeast: status HUD window created");
-#endif
-}
-
-static void EnsureStatusHud()
-{
-    CreateStatusHudForced();
-}
-
-static void SetHudCaption(const char* text)
-{
-#if defined(TOUGHNESSFEAST_LINUX_IDE)
-    (void)text;
-#else
-    if (!text) return;
-    if (g_hudIsEdit && g_hudText)
-        reinterpret_cast<MyGUI::EditBox*>(g_hudText)->setCaption(text);
-    else if (g_hudText)
-        g_hudText->setCaption(text);
-    if (g_hudWindow)
-        g_hudWindow->setVisible(true);
-#endif
-}
-
+// No MyGUI — only throttled DebugLog (safe)
 static void RefreshStatusHud(CharStats* preferStats)
 {
-    if (!g_cfg.showStatusHud) return;
-
-    CharStats* stats = preferStats ? preferStats : TryGetSelectedStats();
-    if (!stats) stats = g_lastStats;
+    if (!preferStats && !g_lastStats) return;
+    CharStats* stats = preferStats ? preferStats : g_lastStats;
     if (stats) g_lastStats = stats;
 
     BuildStatusText(stats);
-    EnsureStatusHud();
-    SetHudCaption(g_statusText);
+
+    // Throttle: log about every ~2s of wound-degen ticks
+    if (!g_cfg.debugLog) return;
+    if (++g_statusLogCooldown < 25) return;
+    g_statusLogCooldown = 0;
+    DebugLog(g_statusText);
 }
 
 // ---------- gameplay (only used if EnableHooks=1) ----------
@@ -1074,10 +870,9 @@ static void InstallHooks()
     else
         DebugLog("ToughnessFeast: food regen OFF (EnableMedicalHooks=0)");
 
-    // HUD: NO TitleScreen hook (that hung game on launch).
-    // Create lazily when CharStats hooks run in-world and MyGUI is ready.
-    if (g_cfg.showStatusHud)
-        DebugLog("ToughnessFeast: status HUD will create in-world when MyGUI is ready");
+    // Status progress: RE_Kenshi DebugLog only (MyGUI HUD removed — crash/hang).
+    if (g_cfg.debugLog)
+        DebugLog("ToughnessFeast: progress lines go to this log (no in-game window)");
 }
 
 #if defined(_MSC_VER)

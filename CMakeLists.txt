@@ -114,8 +114,7 @@ if(_GAME_BUILD)
   endif()
 
   target_link_directories(ToughnessFeast PRIVATE "${KENSHI_LIB_DIR}")
-  target_link_libraries(ToughnessFeast PRIVATE KenshiLib MyGUIEngine_x64)
-  message(STATUS "Linking MyGUIEngine_x64 for status HUD")
+  target_link_libraries(ToughnessFeast PRIVATE KenshiLib)
   message(STATUS "Linking KenshiLib from ${KENSHI_LIB_DIR} (${_libsize} bytes)")
 
 else()
