@@ -396,45 +396,68 @@ static void medicalUpdate_hook(MedicalSystem* self, float frameTime)
 }
 
 // ---------------------------------------------------------------------------
-// Resolve game functions via RVA (from KenshiLib headers for this game build).
-// GetRealAddress(&Class::method) asserts under VS2022 unless LTCG is perfect:
-//   "address appears to be in your own module"
-// RVAs below match KenshiLib_Examples_deps headers (1.0.5x / RE_Kenshi 0.3.x).
+// Resolve game functions through KenshiLib.dll exports, then GetRealAddress.
+// Taking &Class::method in our DLL puts a LOCAL stub address into GetRealAddress,
+// which asserts: "address appears to be in your own module".
+// GetProcAddress(KenshiLib, mangledName) returns a pointer INSIDE KenshiLib.dll,
+// which GetRealAddress can map to the real game function.
 // ---------------------------------------------------------------------------
 
-// public RVA comments from CharStats.h / MedicalSystem.h
-static const uintptr_t RVA_calculateToughnessDamageResistanceMult = 0x643FF0;
-static const uintptr_t RVA_calculateToughnessWoundDegenerationRate = 0x6434F0;
-static const uintptr_t RVA_xpStat_eventBased                       = 0x8C5B60;
-static const uintptr_t RVA_xpStat_timeBased                        = 0x8C5AA0;
-static const uintptr_t RVA_medicalUpdate                           = 0x651880;
-
-static void* KenshiExeBase()
+static void* KenshiLibModule()
 {
-    static void* base = nullptr;
-    if (base) return base;
-#if !defined(TOUGHNESSFEAST_LINUX_IDE)
-    base = (void*)GetModuleHandleA("kenshi_x64.exe");
-    if (!base) base = (void*)GetModuleHandleA("Kenshi_x64.exe");
-    if (!base) base = (void*)GetModuleHandleA(nullptr); // host process
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    return nullptr;
 #else
-    base = (void*)0x400000;
+    static HMODULE h = nullptr;
+    if (!h)
+        h = GetModuleHandleA("KenshiLib.dll");
+    return (void*)h;
 #endif
-    return base;
 }
 
-static void* AtRva(uintptr_t rva)
+// Mangled names match KenshiLib exports (MSVC x64)
+static void* LibExport(const char* mangled)
 {
-    void* b = KenshiExeBase();
-    if (!b) return nullptr;
-    return (void*)((uintptr_t)b + rva);
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    (void)mangled;
+    return nullptr;
+#else
+    HMODULE h = (HMODULE)KenshiLibModule();
+    if (!h)
+    {
+        ErrorLog("ToughnessFeast: KenshiLib.dll not loaded");
+        return nullptr;
+    }
+    void* p = (void*)GetProcAddress(h, mangled);
+    if (!p)
+    {
+        ErrorLog("ToughnessFeast: GetProcAddress failed for:");
+        ErrorLog(mangled);
+    }
+    return p;
+#endif
+}
+
+static void* RealFromExport(const char* mangled)
+{
+    void* exp = LibExport(mangled);
+    if (!exp) return nullptr;
+    // GetRealAddress accepts KenshiLib export thunks (not addresses in our DLL)
+    intptr_t real = KenshiLib::GetRealAddress(exp);
+    if (!real)
+    {
+        ErrorLog("ToughnessFeast: GetRealAddress returned 0 for:");
+        ErrorLog(mangled);
+        return nullptr;
+    }
+    return (void*)real;
 }
 
 static int TryAddHook(void* target, void* detour, void** original, const char* okMsg)
 {
     if (!target)
     {
-        ErrorLog("ToughnessFeast: null target address");
+        ErrorLog("ToughnessFeast: null target");
         ErrorLog(okMsg);
         return 0;
     }
@@ -448,34 +471,52 @@ static int TryAddHook(void* target, void* detour, void** original, const char* o
     return 1;
 }
 
+static int HookExport(const char* mangled, void* detour, void** original, const char* okMsg)
+{
+    void* real = RealFromExport(mangled);
+    return TryAddHook(real, detour, original, okMsg);
+}
+
+// Progressive enable via config — medical is highest risk during world load
 static void InstallHooks()
 {
-    DebugLog("ToughnessFeast: EnableHooks=1, installing via RVA...");
+    DebugLog("ToughnessFeast: EnableHooks=1, resolving via KenshiLib exports...");
 
-    char msg[128];
-    std::snprintf(msg, sizeof(msg), "ToughnessFeast: kenshi base %p", KenshiExeBase());
-    DebugLog(msg);
-
-    TryAddHook(AtRva(RVA_calculateToughnessDamageResistanceMult),
+    // Combat soft-cap (usually safe)
+    HookExport("?calculateToughnessDamageResistanceMult@CharStats@@QEAAMXZ",
                (void*)calculateToughnessDamageResistanceMult_hook,
                (void**)&calculateToughnessDamageResistanceMult_orig,
                "ToughnessFeast: hooked DR");
-    TryAddHook(AtRva(RVA_calculateToughnessWoundDegenerationRate),
+    HookExport("?calculateToughnessWoundDegenerationRate@CharStats@@QEAAMXZ",
                (void*)calculateToughnessWoundDegenerationRate_hook,
                (void**)&calculateToughnessWoundDegenerationRate_orig,
                "ToughnessFeast: hooked wound degen");
-    TryAddHook(AtRva(RVA_xpStat_eventBased),
-               (void*)xpStat_eventBased_hook,
-               (void**)&xpStat_eventBased_orig,
-               "ToughnessFeast: hooked xp event");
-    TryAddHook(AtRva(RVA_xpStat_timeBased),
-               (void*)xpStat_timeBased_hook,
-               (void**)&xpStat_timeBased_orig,
-               "ToughnessFeast: hooked xp time");
-    TryAddHook(AtRva(RVA_medicalUpdate),
-               (void*)medicalUpdate_hook,
-               (void**)&medicalUpdate_orig,
-               "ToughnessFeast: hooked medicalUpdate");
+
+    // XP past 100
+    if (g_cfg.enableXpHooks)
+    {
+        HookExport("?xpStat_eventBased@CharStats@@QEAAXW4StatsEnumerated@@M@Z",
+                   (void*)xpStat_eventBased_hook,
+                   (void**)&xpStat_eventBased_orig,
+                   "ToughnessFeast: hooked xp event");
+        HookExport("?xpStat_timeBased@CharStats@@QEAAXW4StatsEnumerated@@@Z",
+                   (void*)xpStat_timeBased_hook,
+                   (void**)&xpStat_timeBased_orig,
+                   "ToughnessFeast: hooked xp time");
+    }
+    else
+        DebugLog("ToughnessFeast: XP hooks skipped (EnableXpHooks=0)");
+
+    // Food / limb regen — most likely to crash on world load if wrong
+    if (g_cfg.enableMedicalHooks)
+    {
+        HookExport("?medicalUpdate@MedicalSystem@@QEAAXM@Z",
+                   (void*)medicalUpdate_hook,
+                   (void**)&medicalUpdate_orig,
+                   "ToughnessFeast: hooked medicalUpdate");
+    }
+    else
+        DebugLog("ToughnessFeast: medicalUpdate skipped (EnableMedicalHooks=0)");
 }
 
 #if defined(_MSC_VER)
