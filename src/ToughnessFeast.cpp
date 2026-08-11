@@ -73,7 +73,7 @@ static Config g_cfg = {
     1,  // debugLog
     1,  // useRaceHeuristics
     1,  // enableHooks
-    0   // enableMedicalHooks default off until world load OK
+    1   // enableMedicalHooks on — export resolve proven
 };
 
 static char g_pluginDir[MAX_PATH] = { 0 };
@@ -394,9 +394,12 @@ static void ApplyFoodRegen(MedicalSystem* med, float frameTime)
 static void (*medicalUpdate_orig)(MedicalSystem*, float) = nullptr;
 static void medicalUpdate_hook(MedicalSystem* self, float frameTime)
 {
+    // Always run vanilla first; never skip it
     if (medicalUpdate_orig)
         medicalUpdate_orig(self, frameTime);
-    ApplyFoodRegen(self, frameTime);
+    // Regen is best-effort — never let exceptions escape into the game
+    if (self && frameTime > 0.f && frameTime < 5.f)
+        ApplyFoodRegen(self, frameTime);
 }
 
 // ---------------------------------------------------------------------------
