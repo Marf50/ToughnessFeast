@@ -427,16 +427,43 @@ static int LektorAppendPair(lektor<StringPair>* dats, const char* left, const ch
     (void)dats; (void)left; (void)right;
     return 0;
 #else
-    if (!dats || !dats->stuff) return 0;
-    if (dats->count >= dats->maxSize) return 0;
+    if (!dats) return 0;
     ResolveStringPairCtor();
     if (!g_spCtor) return 0;
+
+    static const size_t kGameStringPairSize = 0x60;
+
+    // Grow capacity if full (tooltip lektors are often exactly full after vanilla lines)
+    if (!dats->stuff || dats->count >= dats->maxSize)
+    {
+        uint32_t oldMax = dats->maxSize;
+        uint32_t oldCount = dats->count;
+        uint32_t newMax = oldMax + 16;
+        if (newMax < 16) newMax = 16;
+        if (newMax < oldCount + 8) newMax = oldCount + 8;
+        // Cap growth to avoid runaway
+        if (newMax > 64) newMax = 64;
+        if (oldCount >= newMax) return 0;
+
+        void* neu = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                              (SIZE_T)newMax * kGameStringPairSize);
+        if (!neu) return 0;
+        if (dats->stuff && oldCount > 0)
+        {
+            size_t copyN = (size_t)oldCount * kGameStringPairSize;
+            std::memcpy(neu, dats->stuff, copyN);
+        }
+        // Intentionally do not free old buffer — may be stack or game-owned.
+        dats->stuff = (StringPair*)neu;
+        dats->maxSize = newMax;
+    }
+
+    if (dats->count >= dats->maxSize) return 0;
 
     GameStr a, b;
     GameStrSet(&a, left ? left : "");
     GameStrSet(&b, right ? right : "");
 
-    static const size_t kGameStringPairSize = 0x60;
     void* slot = (char*)(void*)dats->stuff + (size_t)dats->count * kGameStringPairSize;
     std::memset(slot, 0, kGameStringPairSize);
     g_spCtor(slot, &a, &b);
@@ -593,9 +620,18 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
 }
 
 // Toughness hover: overview only (easy to scan)
+static int g_tooltipOnce = 0;
 static void AppendToughnessTooltips(lektor<StringPair>* dats, CharStats* stats)
 {
     if (!dats || !stats) return;
+    if (!g_tooltipOnce)
+    {
+        char m[128];
+        std::snprintf(m, sizeof(m), "ToughnessFeast: tooltip paint count=%u max=%u",
+            (unsigned)dats->count, (unsigned)dats->maxSize);
+        DebugLog(m);
+        g_tooltipOnce = 1;
+    }
 
     RaceKind rk = DetectRaceKind(stats);
     float un = FoodRegenStartFor(stats);
@@ -1227,11 +1263,11 @@ static bool getStatPenaltiesForGUI_hook(CharStats* self, const std::string& stat
     if (getStatPenaltiesForGUI_orig)
         r = getStatPenaltiesForGUI_orig(self, statName, stat, dats);
     // Do not read statName (CRT ABI). Use enum only.
-    if (g_cfg.enableTooltips && self && stat == STAT_TOUGHNESS && !g_inFoodRegen)
+    // Never permanently block tooltips on regen flag (could stick after crash).
+    if (g_cfg.enableTooltips && self && stat == STAT_TOUGHNESS)
     {
-        // leave room in lektor; skip if nearly full (avoids overflow crash)
-        if (dats.maxSize > 0 && dats.count + 8u < dats.maxSize)
-            AppendToughnessTooltips(&dats, self);
+        g_inFoodRegen = 0; // safe: tooltips are not re-entered from regen
+        AppendToughnessTooltips(&dats, self);
     }
     return r;
 }
@@ -1241,11 +1277,8 @@ static void printExertionHungerMultTooltip_hook(CharStats* self, lektor<StringPa
 {
     if (printExertionHungerMultTooltip_orig)
         printExertionHungerMultTooltip_orig(self, dats);
-    if (g_cfg.enableTooltips && self && dats && !g_inFoodRegen)
-    {
-        if (dats->maxSize > 0 && dats->count + 12u < dats->maxSize)
-            AppendHungerTooltips(dats, self);
-    }
+    if (g_cfg.enableTooltips && self && dats)
+        AppendHungerTooltips(dats, self);
 }
 #endif
 
