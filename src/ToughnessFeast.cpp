@@ -94,6 +94,7 @@ struct Config
     float hungerDrainPerSec;
     float minHunger;              // 0..1 fill — below this, heal scale = 0
     float hungerBarMax;           // full bar in game units (~300)
+    float limbMinHunger;          // limbs only regrow above this (points @ bar scale)
     int   healUnhealable;
 
     float limbRegrowPerSec;       // very slow by design
@@ -121,7 +122,7 @@ static Config g_cfg = {
     100.f,                        // combatCap
     75.f, 50.f, 0.f,              // unlocks H/S/Hiv
     0.0045f, 0.0022f, 1.5f,       // scale, hiver scale, power cap (~90% less)
-    0.135f, 0.09f, 0.004f, 0.15f, 300.f, 1,// flesh, stun, drain, minHunger, barMax, unhealable
+    0.135f, 0.09f, 0.004f, 0.15f, 300.f, 200.f, 1,// flesh,stun,drain,minH,barMax,limbMinH,unheal
     0.0085f, 0.40f, 0.12f, 0.18f, 0.70f, 0.25f, // regrow/bud/stumpForm/start/strong/overdmg
     0.28f, 0.55f, 8.0f, 18.0f,    // stumpHunger, restoreHunger, stumpKO, restoreKO
     0.20f,                        // past100 xp
@@ -242,6 +243,7 @@ static void LoadConfig()
         else if (!std::strcmp(key, "HungerDrainPerSecond")) g_cfg.hungerDrainPerSec = fval();
         else if (!std::strcmp(key, "MinHungerToRegen")) g_cfg.minHunger = fval();
         else if (!std::strcmp(key, "HungerBarMax")) g_cfg.hungerBarMax = fval();
+        else if (!std::strcmp(key, "LimbMinHunger")) g_cfg.limbMinHunger = fval();
         else if (!std::strcmp(key, "HealUnhealableWounds")) g_cfg.healUnhealable = bval();
         else if (!std::strcmp(key, "LimbRegrowPerSecond")) g_cfg.limbRegrowPerSec = fval();
         else if (!std::strcmp(key, "LimbBudThreshold")) g_cfg.limbBudThreshold = fval();
@@ -276,6 +278,8 @@ static void LoadConfig()
     if (g_cfg.minHunger > 0.9f) g_cfg.minHunger = 0.9f;
     if (g_cfg.hungerBarMax < 1.f) g_cfg.hungerBarMax = 300.f;
     if (g_cfg.hungerBarMax > 10000.f) g_cfg.hungerBarMax = 10000.f;
+    if (g_cfg.limbMinHunger < 0.f) g_cfg.limbMinHunger = 0.f;
+    if (g_cfg.limbMinHunger > g_cfg.hungerBarMax) g_cfg.limbMinHunger = g_cfg.hungerBarMax;
     if (g_cfg.tooltipMaxLines < 8) g_cfg.tooltipMaxLines = 8;
     if (g_cfg.tooltipMaxLines > 24) g_cfg.tooltipMaxLines = 24;
 
@@ -1511,6 +1515,22 @@ static float HungerFill01(float h)
     return s * s * (3.f - 2.f * s); // smoothstep
 }
 
+// Limbs only when hunger > LimbMinHunger (default 200 of 300)
+static int CanRegrowLimbsAtHunger(float h)
+{
+    if (h != h || h < 0.f) return 0;
+    float need = g_cfg.limbMinHunger;
+    if (need < 0.f) need = 200.f;
+    // 0..1 bar mode: convert points → fraction of bar
+    if (h <= 5.f)
+    {
+        float full = g_cfg.hungerBarMax > 1.f ? g_cfg.hungerBarMax : 300.f;
+        float need01 = need / full;
+        return (h > need01) ? 1 : 0;
+    }
+    return (h > need) ? 1 : 0;
+}
+
 static void SpendHungerAndKnockout(MedicalSystem* med, float hungerFrac, float koSeconds, const char* reason)
 {
     if (!med) return;
@@ -1900,13 +1920,14 @@ static void ApplyFeastTick(CharStats* stats, float dt)
     // Heal strength tracks how full the bar is (0 near starve → 1 full @ ~300)
     float feed = HungerFill01(hunger);
 
-    // Gradual growth only when fed enough; rate scales with fill%
+    // General flesh heal can run when fed; LIMBS need hunger > LimbMinHunger (200)
+    int limbsOk = CanRegrowLimbsAtHunger(hunger);
     int allowGrow = (needsFood && power > 0.f && feed > 0.001f) ? 1 : 0;
-    float growPower = allowGrow ? (power * feed) : 0.f;
+    float growPower = (allowGrow && limbsOk) ? (power * feed) : 0.f;
 
-    // If any stump looks ready, force a process pass with tiny power so restore runs
+    // Limb stage work only above 200 food
     int forceComplete = 0;
-    if (g_cfg.enableLimbRestore)
+    if (g_cfg.enableLimbRestore && limbsOk)
     {
         for (int i = 0; i < 4; ++i)
         {
@@ -1936,10 +1957,11 @@ static void ApplyFeastTick(CharStats* stats, float dt)
         }
     }
 
-    // Stage pops spend a big chunk of food — never when near starving
+    // Stage pops — need limb hunger threshold + not starving after dump
+    if (!limbsOk)
+        forceComplete = 0;
     if (forceComplete && feed < 0.15f)
         forceComplete = 0;
-    // Need enough bar left for the dump (stump ~28%, restore ~55%)
     if (forceComplete && hunger01 < (g_cfg.minHunger + 0.20f))
         forceComplete = 0;
 
@@ -2310,6 +2332,16 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
         line("Feast", r);
         std::snprintf(r, sizeof(r), "%.0f%% of full", feedTip * 100.f);
         line("Heal scale", r);
+        {
+            float hh = med ? MedHunger(med) : 0.f;
+            int lok = CanRegrowLimbsAtHunger(hh);
+            char lr[48];
+            if (lok)
+                std::snprintf(lr, sizeof(lr), "ON (need >%.0f)", g_cfg.limbMinHunger);
+            else
+                std::snprintf(lr, sizeof(lr), "OFF eat>%.0f", g_cfg.limbMinHunger);
+            line("Limb regrow", lr);
+        }
         std::snprintf(r, sizeof(r), "stump -%.0f%%  limb -%.0f%%",
             g_cfg.stumpHungerCost * 100.f, g_cfg.restoreHungerCost * 100.f);
         line("Stage food", r);
