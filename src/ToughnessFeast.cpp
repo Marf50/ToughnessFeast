@@ -324,6 +324,7 @@ static int HookExport(const char* mangled, void* detour, void** original, const 
 }
 #endif
 
+static void ResolveLimbApi();
 static void ResolveStatApi()
 {
 #if defined(TOUGHNESSFEAST_LINUX_IDE)
@@ -567,16 +568,275 @@ struct LimbInfo
     float severity;  // 0..1 combat impact
 };
 
-// RobotLimbs* lives at MedicalSystem+0xC8 in the game binary.
-// Do not use med->robotLimbs field access (map layout drift).
+// ---- Limb mutation (setLimb must hit real game code) ----
+static MedicalSystem::HealthPartStatus* ResolveLimb(MedicalSystem* med, int slot);
+static LimbState ReadLimbState(MedicalSystem* med, int slot);
+
+
+// Find RobotLimbs* on MedicalSystem without trusting compiler offsets.
+// Game comment says 0xC8; boost-map padding can make field access wrong.
+// Scan for a block whose character* matches our Character.
 static RobotLimbs* GetRobotLimbs(MedicalSystem* med)
 {
     if (!med) return nullptr;
-    RobotLimbs* r = nullptr;
-    std::memcpy(&r, (const char*)(void*)med + 0xC8, sizeof(r));
-    if (r && (uintptr_t)r > 0x10000ull) return r;
+    Character* me = med->me;
+    if (!me && med->stats) me = med->stats->me;
+
+    // Try documented offset first
+    {
+        RobotLimbs* r = nullptr;
+        std::memcpy(&r, (const char*)(void*)med + 0xC8, sizeof(r));
+        if (r && (uintptr_t)r > 0x10000ull)
+        {
+            if (!me) return r;
+            Character* owner = nullptr;
+            std::memcpy(&owner, (const char*)(void*)r + 0x0, sizeof(owner));
+            if (owner == me) return r;
+        }
+    }
+
+    // Scan nearby pointer slots for RobotLimbs { Character* at 0 }
+    if (me)
+    {
+        for (size_t off = 0x40; off <= 0x1F0; off += sizeof(void*))
+        {
+            RobotLimbs* r = nullptr;
+            std::memcpy(&r, (const char*)(void*)med + off, sizeof(r));
+            if (!r || (uintptr_t)r < 0x10000ull) continue;
+            // reject obvious non-heap (very high or low)
+            Character* owner = nullptr;
+            TF_SEH_TRY
+            {
+                std::memcpy(&owner, (const char*)(void*)r + 0x0, sizeof(owner));
+            }
+            TF_SEH_EXCEPT { continue; }
+            if (owner == me)
+            {
+                if (g_cfg.debugLog)
+                {
+                    static size_t s_off = 0;
+                    if (s_off != off)
+                    {
+                        s_off = off;
+                        char msg[80];
+                        std::snprintf(msg, sizeof(msg),
+                            "ToughnessFeast: robotLimbs @ MedicalSystem+0x%X", (unsigned)off);
+                        Log(msg);
+                    }
+                }
+                return r;
+            }
+        }
+    }
     return nullptr;
 }
+
+// Resolve game setLimb — direct C++ call may not land in kenshi.exe
+typedef void (*Game_SetLimbFn)(RobotLimbs* self, int limb, int state, void* item);
+typedef void (*Game_SetRobotLimbItemFn)(MedicalSystem* self, int limb, void* item, bool loading);
+typedef LimbState (*Game_GetLimbStateFn)(const MedicalSystem* self, int limb);
+
+static Game_SetLimbFn           g_setLimb = nullptr;
+static Game_SetRobotLimbItemFn  g_setRobotLimbItem = nullptr;
+static Game_GetLimbStateFn      g_getLimbState = nullptr;
+static int                      g_limbApiTried = 0;
+
+static void ResolveLimbApi()
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    return;
+#else
+    if (g_limbApiTried) return;
+    g_limbApiTried = 1;
+
+    // Prefer KenshiLib GetRealAddress on member pointers (LTCG build)
+    TF_SEH_TRY
+    {
+        intptr_t a = KenshiLib::GetRealAddress(&RobotLimbs::setLimb);
+        if (a) g_setLimb = (Game_SetLimbFn)a;
+    }
+    TF_SEH_EXCEPT { }
+
+    TF_SEH_TRY
+    {
+        intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::setRobotLimbItem);
+        if (a) g_setRobotLimbItem = (Game_SetRobotLimbItemFn)a;
+    }
+    TF_SEH_EXCEPT { }
+
+    TF_SEH_TRY
+    {
+        intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::getLimbState);
+        if (a) g_getLimbState = (Game_GetLimbStateFn)a;
+    }
+    TF_SEH_EXCEPT { }
+
+    // RVA fallback relative to main exe (KenshiLib comments, 1.0.5x)
+    if (!g_setLimb || !g_setRobotLimbItem)
+    {
+        HMODULE exe = GetModuleHandleA(nullptr);
+        if (!exe) exe = GetModuleHandleA("kenshi_x64.exe");
+        if (!exe) exe = GetModuleHandleA("kenshi_GOG_x64.exe");
+        if (exe)
+        {
+            unsigned char* base = (unsigned char*)exe;
+            if (!g_setLimb)
+                g_setLimb = (Game_SetLimbFn)(base + 0xCFD90);
+            if (!g_setRobotLimbItem)
+                g_setRobotLimbItem = (Game_SetRobotLimbItemFn)(base + 0x644F10);
+            if (!g_getLimbState)
+                g_getLimbState = (Game_GetLimbStateFn)(base + 0x6433B0);
+        }
+    }
+
+    if (g_setLimb) Log("ToughnessFeast: setLimb resolved");
+    else LogErr("ToughnessFeast: setLimb NOT resolved");
+    if (g_setRobotLimbItem) Log("ToughnessFeast: setRobotLimbItem resolved");
+    if (g_getLimbState) Log("ToughnessFeast: getLimbState resolved");
+#endif
+}
+
+// Actually restore an organic limb. Returns 1 if state looks ORIGINAL after.
+static int ForceRestoreOrganicLimb(MedicalSystem* med, int slot)
+{
+    if (!med) return 0;
+    ResolveLimbApi();
+
+    static const RobotLimbs::Limb kEnum[4] = {
+        RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
+        RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
+    };
+    RobotLimbs::Limb limb = kEnum[slot];
+
+    RobotLimbs* robots = GetRobotLimbs(med);
+    int ok = 0;
+
+    TF_SEH_TRY
+    {
+        // 1) Primary: RobotLimbs::setLimb(ORIGINAL, null item)
+        if (robots && g_setLimb)
+        {
+            g_setLimb(robots, (int)limb, (int)LIMB_ORIGINAL, nullptr);
+            ok = 1;
+        }
+        else if (robots)
+        {
+            // Direct call as last resort (may be a stub)
+            robots->setLimb(limb, LIMB_ORIGINAL, nullptr);
+            ok = 1;
+        }
+
+        // 2) Raw state table write: LimbState states[4] @ +0x10
+        if (robots)
+        {
+            LimbState* states = (LimbState*)((char*)(void*)robots + 0x10);
+            states[(int)limb] = LIMB_ORIGINAL;
+            // items[4] @ +0x20
+            void** items = (void**)((char*)(void*)robots + 0x20);
+            items[(int)limb] = nullptr;
+            ok = 1;
+        }
+
+        // 3) MedicalSystem::setRobotLimbItem(limb, null, loading=true)
+        //    loading path often rebuilds organic limb without prosthetic item
+        if (g_setRobotLimbItem)
+        {
+            g_setRobotLimbItem(med, (int)limb, nullptr, true);
+            ok = 1;
+        }
+        else
+        {
+            med->setRobotLimbItem(limb, nullptr, true);
+            ok = 1;
+        }
+    }
+    TF_SEH_EXCEPT
+    {
+        LogErr("ToughnessFeast: ForceRestoreOrganicLimb SEH");
+        return 0;
+    }
+
+    // 4) Heal the part if it exists / reappears
+    MedicalSystem::HealthPartStatus* part = ResolveLimb(med, slot);
+    if (part)
+    {
+        TF_SEH_TRY
+        {
+            float maxHp = PartMaxHp(part);
+            float start = maxHp * g_cfg.limbRestoredStart;
+            if (start < 1.f) start = maxHp * 0.18f;
+            part->flesh = start;
+            if (part->fleshStun < maxHp * 0.4f)
+                part->fleshStun = maxHp * 0.4f;
+            part->updateDerivedHealths();
+        }
+        TF_SEH_EXCEPT { }
+    }
+
+    // Verify
+    LimbState after = ReadLimbState(med, slot);
+    if (g_cfg.debugLog)
+    {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+            "ToughnessFeast: ForceRestore slot %d afterState=%d robots=%p setLimb=%p",
+            slot, (int)after, (void*)robots, (void*)g_setLimb);
+        Log(msg);
+    }
+    return (after == LIMB_ORIGINAL) ? 1 : (ok ? 1 : 0);
+}
+
+static int ForceFormStump(MedicalSystem* med, int slot)
+{
+    if (!med) return 0;
+    ResolveLimbApi();
+    static const RobotLimbs::Limb kEnum[4] = {
+        RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
+        RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
+    };
+    RobotLimbs::Limb limb = kEnum[slot];
+    RobotLimbs* robots = GetRobotLimbs(med);
+
+    TF_SEH_TRY
+    {
+        if (robots && g_setLimb)
+            g_setLimb(robots, (int)limb, (int)LIMB_STUMP, nullptr);
+        else if (robots)
+            robots->setLimb(limb, LIMB_STUMP, nullptr);
+
+        if (robots)
+        {
+            LimbState* states = (LimbState*)((char*)(void*)robots + 0x10);
+            states[(int)limb] = LIMB_STUMP;
+            void** items = (void**)((char*)(void*)robots + 0x20);
+            items[(int)limb] = nullptr;
+        }
+
+        if (g_setRobotLimbItem)
+            g_setRobotLimbItem(med, (int)limb, nullptr, true);
+    }
+    TF_SEH_EXCEPT
+    {
+        LogErr("ToughnessFeast: ForceFormStump SEH");
+        return 0;
+    }
+
+    MedicalSystem::HealthPartStatus* part = ResolveLimb(med, slot);
+    if (part)
+    {
+        TF_SEH_TRY
+        {
+            float maxHp = PartMaxHp(part);
+            float nub = maxHp * 0.05f;
+            if (nub < 1.f) nub = 1.f;
+            part->flesh = nub;
+            part->updateDerivedHealths();
+        }
+        TF_SEH_EXCEPT { }
+    }
+    return 1;
+}
+
 
 static MedicalSystem::HealthPartStatus* ResolveLimb(MedicalSystem* med, int slot)
 {
@@ -619,8 +879,15 @@ static LimbState ReadLimbState(MedicalSystem* med, int slot)
     };
     LimbState st = LIMB_ORIGINAL;
 
-    // 1) MedicalSystem::getLimbState — method, layout-safe
-    TF_SEH_TRY { st = med->getLimbState(kEnum[slot]); }
+    ResolveLimbApi();
+    // 1) MedicalSystem::getLimbState — prefer resolved game addr
+    TF_SEH_TRY
+    {
+        if (g_getLimbState)
+            st = g_getLimbState(med, (int)kEnum[slot]);
+        else
+            st = med->getLimbState(kEnum[slot]);
+    }
     TF_SEH_EXCEPT { st = LIMB_ORIGINAL; }
 
     // 2) RobotLimbs table (raw pointer @ 0xC8)
@@ -970,9 +1237,9 @@ static void ProcessLimbs(
     {
         static int s_nr = 0;
         if (g_cfg.debugLog && (++s_nr % 40) == 1)
-            Log("ToughnessFeast: robotLimbs null @0xC8 — cannot setLimb");
-        return;
+            Log("ToughnessFeast: robotLimbs not found — ForceRestore will still try setRobotLimbItem");
     }
+    ResolveLimbApi();
 
     // Growth budget (0 if feast locked — still allow completing already-full buds)
     float budget = 0.f;
@@ -1023,16 +1290,7 @@ static void ProcessLimbs(
 
                 if (!part)
                 {
-                    robots->setLimb(kEnum[i], LIMB_STUMP, nullptr);
-                    part = ResolveLimb(med, i);
-                    if (part)
-                    {
-                        float nub = PartMaxHp(part) * 0.04f;
-                        if (nub < 1.f) nub = 1.f;
-                        part->flesh = nub;
-                        TF_SEH_TRY { part->updateDerivedHealths(); }
-                        TF_SEH_EXCEPT { }
-                    }
+                    ForceFormStump(med, i);
                     anyHeal = 1;
                     SpendHungerAndKnockout(med, g_cfg.stumpHungerCost, g_cfg.stumpKoSeconds,
                         "formed STUMP (no part)");
@@ -1075,16 +1333,7 @@ static void ProcessLimbs(
                 int ready = (flesh >= formNeed * 0.95f) || (flesh >= maxHp * 0.95f && flesh > 0.f) ? 1 : 0;
                 if (ready)
                 {
-                    robots->setLimb(kEnum[i], LIMB_STUMP, nullptr);
-                    part = ResolveLimb(med, i);
-                    if (part)
-                    {
-                        float nub = PartMaxHp(part) * 0.05f;
-                        if (nub < 1.f) nub = 1.f;
-                        part->flesh = nub;
-                        TF_SEH_TRY { part->updateDerivedHealths(); }
-                        TF_SEH_EXCEPT { }
-                    }
+                    ForceFormStump(med, i);
                     anyHeal = 1;
                     SpendHungerAndKnockout(med, g_cfg.stumpHungerCost, g_cfg.stumpKoSeconds,
                         "formed STUMP");
@@ -1099,18 +1348,7 @@ static void ProcessLimbs(
 
                 if (!part)
                 {
-                    // Stump with no part — try force original restore path
-                    robots->setLimb(kEnum[i], LIMB_ORIGINAL, nullptr);
-                    part = ResolveLimb(med, i);
-                    if (part)
-                    {
-                        float start = PartMaxHp(part) * g_cfg.limbRestoredStart;
-                        if (start < 1.f) start = PartMaxHp(part) * 0.18f;
-                        part->flesh = start;
-                        part->fleshStun = PartMaxHp(part) * 0.45f;
-                        TF_SEH_TRY { part->updateDerivedHealths(); }
-                        TF_SEH_EXCEPT { }
-                    }
+                    ForceRestoreOrganicLimb(med, i);
                     anyHeal = 1;
                     SpendHungerAndKnockout(med, g_cfg.restoreHungerCost, g_cfg.restoreKoSeconds,
                         "RESTORED limb (null stump part)");
@@ -1163,44 +1401,23 @@ static void ProcessLimbs(
 
                 if (ready)
                 {
-                    // Try setLimb ORIGINAL — retry if still stump next ticks
-                    robots->setLimb(kEnum[i], LIMB_ORIGINAL, nullptr);
-
-                    // Also poke robotLimbs state array raw if still wrong after
-                    part = ResolveLimb(med, i);
-                    LimbState after = ReadLimbState(med, i);
-
-                    if (after == LIMB_STUMP || after == LIMB_CRUSHED)
-                    {
-                        // Second attempt
-                        robots->setLimb(kEnum[i], LIMB_ORIGINAL, nullptr);
-                        part = ResolveLimb(med, i);
-                        after = ReadLimbState(med, i);
-                    }
-
-                    if (part)
-                    {
-                        maxHp = PartMaxHp(part);
-                        float start = maxHp * g_cfg.limbRestoredStart;
-                        if (start < 1.f) start = maxHp * 0.18f;
-                        part->flesh = start;
-                        if (part->fleshStun < maxHp * 0.45f)
-                            part->fleshStun = maxHp * 0.45f;
-                        TF_SEH_TRY { part->updateDerivedHealths(); }
-                        TF_SEH_EXCEPT { }
-                    }
+                    int restored = ForceRestoreOrganicLimb(med, i);
+                    // Retry once next frame if still stump — still KO/food this time
+                    if (!restored)
+                        ForceRestoreOrganicLimb(med, i);
 
                     anyHeal = 1;
                     if (worstSev < 0.85f) worstSev = 0.85f;
 
-                    char why[80];
+                    LimbState after = ReadLimbState(med, i);
+                    char why[96];
                     std::snprintf(why, sizeof(why),
-                        "RESTORED limb slot %d (prog=%.0f%% after=%d)",
+                        "RESTORED limb slot %d (prog=%.0f%% state=%d)",
                         i, prog * 100.f, (int)after);
                     SpendHungerAndKnockout(med, g_cfg.restoreHungerCost, g_cfg.restoreKoSeconds, why);
 
-                    if (g_cfg.debugLog && after != LIMB_ORIGINAL)
-                        Log("ToughnessFeast: setLimb ORIGINAL may have failed — will retry");
+                    if (after != LIMB_ORIGINAL && g_cfg.debugLog)
+                        Log("ToughnessFeast: still not ORIGINAL after ForceRestore — will retry next tick");
                     continue;
                 }
             }
@@ -1660,6 +1877,7 @@ static void InstallHooks()
 {
     Log("ToughnessFeast: installing hooks...");
     ResolveStatApi();
+    ResolveLimbApi();
 
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
     HookExport("?calculateToughnessDamageResistanceMult@CharStats@@QEAAMXZ",
