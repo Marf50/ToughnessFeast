@@ -711,9 +711,28 @@ static int ForceRestoreOrganicLimb(MedicalSystem* med, int slot)
     RobotLimbs* robots = GetRobotLimbs(med);
     int ok = 0;
 
+    if (g_cfg.debugLog)
+    {
+        char msg[120];
+        std::snprintf(msg, sizeof(msg),
+            "ToughnessFeast: ForceRestore begin slot %d robots=%p setLimb=%p setItem=%p",
+            slot, (void*)robots, (void*)g_setLimb, (void*)g_setRobotLimbItem);
+        Log(msg);
+    }
+
     TF_SEH_TRY
     {
-        // 1) Primary: RobotLimbs::setLimb(ORIGINAL, null item)
+        // A) Raw state table FIRST (doesn't depend on call convention)
+        if (robots)
+        {
+            LimbState* states = (LimbState*)((char*)(void*)robots + 0x10);
+            states[(int)limb] = LIMB_ORIGINAL;
+            void** items = (void**)((char*)(void*)robots + 0x20);
+            items[(int)limb] = nullptr;
+            ok = 1;
+        }
+
+        // B) Real setLimb(ORIGINAL, null)
         if (robots && g_setLimb)
         {
             g_setLimb(robots, (int)limb, (int)LIMB_ORIGINAL, nullptr);
@@ -721,33 +740,31 @@ static int ForceRestoreOrganicLimb(MedicalSystem* med, int slot)
         }
         else if (robots)
         {
-            // Direct call as last resort (may be a stub)
             robots->setLimb(limb, LIMB_ORIGINAL, nullptr);
             ok = 1;
         }
 
-        // 2) Raw state table write: LimbState states[4] @ +0x10
-        if (robots)
-        {
-            LimbState* states = (LimbState*)((char*)(void*)robots + 0x10);
-            states[(int)limb] = LIMB_ORIGINAL;
-            // items[4] @ +0x20
-            void** items = (void**)((char*)(void*)robots + 0x20);
-            items[(int)limb] = nullptr;
-            ok = 1;
-        }
-
-        // 3) MedicalSystem::setRobotLimbItem(limb, null, loading=true)
-        //    loading path often rebuilds organic limb without prosthetic item
+        // C) setRobotLimbItem null — try loading=true then false
         if (g_setRobotLimbItem)
         {
             g_setRobotLimbItem(med, (int)limb, nullptr, true);
+            g_setRobotLimbItem(med, (int)limb, nullptr, false);
             ok = 1;
         }
         else
         {
             med->setRobotLimbItem(limb, nullptr, true);
+            med->setRobotLimbItem(limb, nullptr, false);
             ok = 1;
+        }
+
+        // D) Re-write state table after game funcs (they may clobber)
+        if (robots)
+        {
+            LimbState* states = (LimbState*)((char*)(void*)robots + 0x10);
+            states[(int)limb] = LIMB_ORIGINAL;
+            void** items = (void**)((char*)(void*)robots + 0x20);
+            items[(int)limb] = nullptr;
         }
     }
     TF_SEH_EXCEPT
@@ -756,7 +773,7 @@ static int ForceRestoreOrganicLimb(MedicalSystem* med, int slot)
         return 0;
     }
 
-    // 4) Heal the part if it exists / reappears
+    // E) Flesh / derived healths
     MedicalSystem::HealthPartStatus* part = ResolveLimb(med, slot);
     if (part)
     {
@@ -765,6 +782,7 @@ static int ForceRestoreOrganicLimb(MedicalSystem* med, int slot)
             float maxHp = PartMaxHp(part);
             float start = maxHp * g_cfg.limbRestoredStart;
             if (start < 1.f) start = maxHp * 0.18f;
+            // If still stump visually, push flesh well positive anyway
             part->flesh = start;
             if (part->fleshStun < maxHp * 0.4f)
                 part->fleshStun = maxHp * 0.4f;
@@ -773,18 +791,25 @@ static int ForceRestoreOrganicLimb(MedicalSystem* med, int slot)
         TF_SEH_EXCEPT { }
     }
 
-    // Verify
+    // F) Ask medical to refresh
+    TF_SEH_TRY { med->updateStats(); }
+    TF_SEH_EXCEPT { }
+    TF_SEH_TRY { med->validateHealthValues(); }
+    TF_SEH_EXCEPT { }
+
     LimbState after = ReadLimbState(med, slot);
     if (g_cfg.debugLog)
     {
         char msg[128];
         std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: ForceRestore slot %d afterState=%d robots=%p setLimb=%p",
-            slot, (int)after, (void*)robots, (void*)g_setLimb);
+            "ToughnessFeast: ForceRestore end slot %d afterState=%d part=%p",
+            slot, (int)after, (void*)part);
         Log(msg);
     }
+    // Return success if state is ORIGINAL OR we at least ran the calls
     return (after == LIMB_ORIGINAL) ? 1 : (ok ? 1 : 0);
 }
+
 
 static int ForceFormStump(MedicalSystem* med, int slot)
 {
@@ -1472,16 +1497,22 @@ static void ApplyFeastTick(CharStats* stats, float dt)
     if (!med || med->dead) return;
 
     Character* me = CharFromStats(stats);
-    if (!me || !me->amSomeoneWhoNeedsToEatToLive()) return;
+    // Do NOT early-out on amSomeoneWhoNeedsToEatToLive for limb stage completion —
+    // that gate previously blocked restores entirely for some races / states.
+    int needsFood = 1;
+    if (me)
+    {
+        TF_SEH_TRY { needsFood = me->amSomeoneWhoNeedsToEatToLive() ? 1 : 0; }
+        TF_SEH_EXCEPT { needsFood = 1; }
+    }
 
     float power = FeastPower(stats);
     float hunger = med->hunger;
-    if (hunger != hunger || hunger < 0.f || hunger > 5.f) return;
+    if (hunger != hunger || hunger < 0.f || hunger > 5.f) hunger = 1.f;
 
-    // Always try limb stage COMPLETIONS (stump 100% → restore) even if
-    // feast is locked or hunger is low — otherwise progress freezes at 100%.
-    // Gradual growth still needs power + min hunger.
-    int allowGrow = (power > 0.f && hunger >= g_cfg.minHunger) ? 1 : 0;
+    // Gradual growth needs power + hunger + organic eater.
+    // Stage completions (READY stump) always allowed.
+    int allowGrow = (needsFood && power > 0.f && hunger >= g_cfg.minHunger) ? 1 : 0;
     float growPower = allowGrow ? power : 0.f;
 
     // If any stump looks ready, force a process pass with tiny power so restore runs
@@ -1517,6 +1548,16 @@ static void ApplyFeastTick(CharStats* stats, float dt)
     }
 
     if (!allowGrow && !forceComplete) return;
+
+    static int s_tickLog = 0;
+    if (g_cfg.debugLog && (++s_tickLog % 40) == 1)
+    {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+            "ToughnessFeast: tick p=%.2f grow=%d force=%d hunger=%.2f robots=%p",
+            power, allowGrow, forceComplete, hunger, (void*)GetRobotLimbs(med));
+        Log(msg);
+    }
 
     g_inRegen = 1;
 
@@ -1771,6 +1812,99 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
     if (med)
         nLimbs = CollectLimbs(stats, limbs, 4);
 
+    // CRITICAL: hunger tip is the one place we KNOW runs for this character.
+    // xpStat_timeBased can be sparse while idle — drive feast + ready restores here.
+    {
+        static unsigned s_lastTickMs = 0;
+        unsigned now = 0;
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+        now = GetTickCount();
+#else
+        static unsigned fake = 0; now = ++fake * 50;
+#endif
+        if (s_lastTickMs == 0 || (now - s_lastTickMs) >= 250u)
+        {
+            s_lastTickMs = now;
+            TF_SEH_TRY { ApplyFeastTick(stats, 0.25f); }
+            TF_SEH_EXCEPT { LogErr("ToughnessFeast: tip ApplyFeastTick SEH"); }
+        }
+
+        // Immediate restore for any stump that CollectLimbs marks READY
+        // (bud 100% / "READY — restoring")
+        static unsigned s_lastForceMs[4] = {0, 0, 0, 0};
+        for (int i = 0; i < nLimbs && i < 4; ++i)
+        {
+            if (!limbs[i].missing) continue;
+            // READY text is written into detail by CollectLimbs
+            int ready = 0;
+            if (std::strstr(limbs[i].detail, "READY") != nullptr) ready = 1;
+            if (std::strstr(limbs[i].stage, "Stump") != nullptr &&
+                std::strstr(limbs[i].detail, "100") != nullptr) ready = 1;
+            // Also re-check flesh for stump
+            if (!ready && med)
+            {
+                LimbState st = ReadLimbState(med, i);
+                if (st == LIMB_STUMP || st == LIMB_CRUSHED)
+                {
+                    MedicalSystem::HealthPartStatus* part = ResolveLimb(med, i);
+                    if (st == LIMB_CRUSHED && !part) ready = 1;
+                    if (part)
+                    {
+                        float maxHp = PartMaxHp(part);
+                        float flesh = part->flesh;
+                        if (flesh != flesh) flesh = 0.f;
+                        if (st == LIMB_STUMP)
+                        {
+                            float target = LimbBudTarget(maxHp);
+                            float prog = target > 0.01f ? ((flesh > 0.f ? flesh : 0.f) / target) : 0.f;
+                            if (prog >= 0.95f || flesh >= maxHp * 0.90f) ready = 1;
+                        }
+                    }
+                }
+            }
+            if (!ready) continue;
+            if (s_lastForceMs[i] != 0 && (now - s_lastForceMs[i]) < 2000u) continue;
+            s_lastForceMs[i] = now;
+
+            char msg[96];
+            std::snprintf(msg, sizeof(msg),
+                "ToughnessFeast: tip-force restore slot %d (%s)", i, limbs[i].name);
+            Log(msg);
+
+            int ok = 0;
+            TF_SEH_TRY
+            {
+                if (ReadLimbState(med, i) == LIMB_CRUSHED)
+                    ok = ForceFormStump(med, i);
+                else
+                    ok = ForceRestoreOrganicLimb(med, i);
+            }
+            TF_SEH_EXCEPT { LogErr("ToughnessFeast: tip-force SEH"); ok = 0; }
+
+            // Cost based on pre-restore intent (stump→limb uses restore cost)
+            {
+                int wasCrushed = (std::strstr(limbs[i].stage, "Missing") != nullptr) ? 1 : 0;
+                float cost = wasCrushed ? g_cfg.stumpHungerCost : g_cfg.restoreHungerCost;
+                float ko = wasCrushed ? g_cfg.stumpKoSeconds : g_cfg.restoreKoSeconds;
+                SpendHungerAndKnockout(med, cost, ko, "tip-force stage complete");
+            }
+            if (!ok)
+            {
+                LimbState after = ReadLimbState(med, i);
+                std::snprintf(msg, sizeof(msg),
+                    "ToughnessFeast: tip-force FAILED slot %d state=%d", i, (int)after);
+                Log(msg);
+            }
+            else
+            {
+                LimbState after = ReadLimbState(med, i);
+                std::snprintf(msg, sizeof(msg),
+                    "ToughnessFeast: tip-force OK slot %d state=%d", i, (int)after);
+                Log(msg);
+            }
+        }
+    }
+
     int active = 0, missing = 0;
     line("-- Limbs --", "4 slots");
     if (nLimbs <= 0)
@@ -1840,13 +1974,14 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
         line("Note", "stage done = food dump + KO");
     line("== end ==", "hover Hunger");
 
+    // Throttled diagnostics (avoid flooding RE_Kenshi log while hovering)
     static int tipLog = 0;
-    if (g_cfg.debugLog && ((++tipLog) % 5) == 1)
+    if (g_cfg.debugLog && ((++tipLog) % 80) == 1)
     {
-        char msg[160];
+        char msg[200];
         std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: journal t=%d limbs=%d miss=%d act=%d",
-            tInt, nLimbs, missing, active);
+            "ToughnessFeast: journal t=%d race=%s pwr=%.2f un=%.0f limbs=%d miss=%d act=%d",
+            tInt, RaceName(rk), power, unlock, nLimbs, missing, active);
         Log(msg);
     }
 }
