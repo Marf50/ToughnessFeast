@@ -688,7 +688,7 @@ static void AppendToughnessTooltips(lektor<StringPair>* dats, CharStats* stats)
         char r[64];
         std::snprintf(r, sizeof(r), "~%.1f%% bar / sec", foodUse);
         LektorAppendPair(dats, "Food use while healing", r);
-        LektorAppendPair(dats, "Tip", "Hover food for details");
+        LektorAppendPair(dats, "Tip", "Hover limbs for stage");
     }
     else
     {
@@ -707,13 +707,16 @@ static void AppendHungerTooltips(lektor<StringPair>* dats, CharStats* stats)
     MedicalSystem* med = stats->medical;
     float hunger = (med && med->hunger >= 0.f && med->hunger <= 5.f) ? med->hunger : -1.f;
 
-    LektorAppendPair(dats, "Toughness Feast", "food & limbs");
+    LimbTip limbs[4];
+    int nLimbs = CollectLimbTips(stats, limbs, 4);
+    int active = 0;
+    for (int i = 0; i < nLimbs; ++i) if (limbs[i].active) ++active;
 
-    // --- food block ---
+    LektorAppendPair(dats, "Toughness Feast", "food");
     if (pwr <= 0.f)
     {
         char r[64];
-        std::snprintf(r, sizeof(r), "Need %.0f toughness first", un);
+        std::snprintf(r, sizeof(r), "Need %.0f toughness", un);
         LektorAppendPair(dats, "Limb regen", r);
         LektorAppendPair(dats, "Food use now", "0% (locked)");
     }
@@ -722,50 +725,223 @@ static void AppendHungerTooltips(lektor<StringPair>* dats, CharStats* stats)
         LektorAppendPair(dats, "Limb regen", "Active while fed");
         {
             char r[64];
-            std::snprintf(r, sizeof(r), "~%.1f%% of food bar / sec", foodUse);
+            std::snprintf(r, sizeof(r), "~%.1f%% bar / sec", foodUse);
             LektorAppendPair(dats, "Food use while healing", r);
-        }
-        {
-            char r[64];
-            // rough: full bar seconds
-            float sec = (foodUse > 0.01f) ? (100.f / foodUse) : 0.f;
-            if (sec > 0.f && sec < 10000.f)
-                std::snprintf(r, sizeof(r), "~%.0f sec per full bar", sec);
-            else
-                std::snprintf(r, sizeof(r), "low");
-            LektorAppendPair(dats, "Full-bar lasts", r);
         }
         if (hunger >= 0.f)
         {
             char r[64];
             int fed = hunger >= g_cfg.minHungerToRegen ? 1 : 0;
-            std::snprintf(r, sizeof(r), "%.0f%%  %s", hunger * 100.f, fed ? "(fed OK)" : "(too hungry!)");
+            std::snprintf(r, sizeof(r), "%.0f%% %s", hunger * 100.f, fed ? "(fed OK)" : "(too hungry)");
             LektorAppendPair(dats, "Current fullness", r);
         }
-        LektorAppendPair(dats, "Note", "More hurt limbs = more food");
-    }
-
-    // --- per-limb block ---
-    LimbTip limbs[4];
-    int nLimbs = CollectLimbTips(stats, limbs, 4);
-    if (nLimbs <= 0)
-    {
-        LektorAppendPair(dats, "Limbs", "no data");
-        return;
-    }
-
-    LektorAppendPair(dats, "--- Limbs ---", "stage / progress");
-    for (int i = 0; i < nLimbs; ++i)
-    {
-        // Line 1: name = stage
-        LektorAppendPair(dats, limbs[i].name, limbs[i].stage);
-        // Line 2: blank-ish label + detail (readable sentence)
-        LektorAppendPair(dats, " ", limbs[i].detail);
+        {
+            char r[64];
+            if (active <= 0) std::snprintf(r, sizeof(r), "none");
+            else std::snprintf(r, sizeof(r), "%d regrowing", active);
+            LektorAppendPair(dats, "Limbs healing", r);
+        }
+        LektorAppendPair(dats, "Tip", "Hover limb bars for stage");
     }
 }
 
 // Still build short log line (no GUI)
 static CharStats* g_lastStats = nullptr;
+
+// ---------------------------------------------------------------------------
+// Limb HUD tooltips — ToolTip::setup(lektor) after vanilla builds limb lines
+// RVA 0x920AB0 setup(Widget*, lektor const&), addLine RVA 0x920ED0
+// ---------------------------------------------------------------------------
+
+static void* GameBase()
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    return nullptr;
+#else
+    static void* base = nullptr;
+    if (!base)
+    {
+        HMODULE exe = GetModuleHandleA(nullptr);
+        if (!exe) exe = GetModuleHandleA("kenshi_GOG_x64.exe");
+        if (!exe) exe = GetModuleHandleA("kenshi_x64.exe");
+        base = (void*)exe;
+    }
+    return base;
+#endif
+}
+
+static const char* ReadGameStrPtr(const void* strObj)
+{
+    if (!strObj) return "";
+    const unsigned char* p = (const unsigned char*)strObj;
+    size_t size = 0, res = 0;
+    std::memcpy(&size, p + 16, sizeof(size));
+    std::memcpy(&res, p + 24, sizeof(res));
+    if (size == 0 || size > 256) return "";
+    if (res > 0x100000u) return "";
+    const char* data = nullptr;
+    if (res < 16u)
+        data = (const char*)p;
+    else
+        std::memcpy(&data, p, sizeof(data));
+    return data ? data : "";
+}
+
+static int DetectLimbSlotFromText(const char* text)
+{
+    if (!text || !text[0]) return -1;
+    char buf[128];
+    size_t n = 0;
+    while (text[n] && n < 127)
+    {
+        char c = text[n];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        buf[n++] = c;
+    }
+    buf[n] = 0;
+
+    int isLeft = (std::strstr(buf, "left") != nullptr) || (std::strstr(buf, "l.") != nullptr)
+              || (std::strstr(buf, "l arm") != nullptr) || (std::strstr(buf, "l leg") != nullptr);
+    int isRight = (std::strstr(buf, "right") != nullptr) || (std::strstr(buf, "r.") != nullptr)
+               || (std::strstr(buf, "r arm") != nullptr) || (std::strstr(buf, "r leg") != nullptr);
+    int isArm = (std::strstr(buf, "arm") != nullptr);
+    int isLeg = (std::strstr(buf, "leg") != nullptr);
+
+    // "left arm" / "right leg" etc.
+    if (isArm && isLeft) return 0;
+    if (isArm && isRight) return 1;
+    if (isLeg && isLeft) return 2;
+    if (isLeg && isRight) return 3;
+
+    // Kenshi sometimes "Arm (L)" style
+    if (isArm && !isRight && std::strstr(buf, "(l)")) return 0;
+    if (isArm && std::strstr(buf, "(r)")) return 1;
+    if (isLeg && !isRight && std::strstr(buf, "(l)")) return 2;
+    if (isLeg && std::strstr(buf, "(r)")) return 3;
+
+    return -1;
+}
+
+static int DetectLimbSlotFromLektor(const lektor<StringPair>* lines)
+{
+    if (!lines || !lines->stuff || lines->count == 0) return -1;
+    static const size_t kPair = 0x60;
+    unsigned n = lines->count;
+    if (n > 32) n = 32;
+    for (unsigned i = 0; i < n; ++i)
+    {
+        const char* base = (const char*)(void*)lines->stuff + (size_t)i * kPair;
+        // s1 @ +0x8, s2 @ +0x30 (KenshiLib StringPair layout)
+        int s = DetectLimbSlotFromText(ReadGameStrPtr(base + 0x8));
+        if (s >= 0) return s;
+        s = DetectLimbSlotFromText(ReadGameStrPtr(base + 0x30));
+        if (s >= 0) return s;
+    }
+    return -1;
+}
+
+// ToolTip::addLine(string const&, string const&)
+typedef void (*ToolTipAddLineFn)(void* self, const GameStr* left, const GameStr* right);
+static ToolTipAddLineFn g_tipAddLine = nullptr;
+
+static void TipAddLine(void* tip, const char* left, const char* right)
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    (void)tip; (void)left; (void)right;
+#else
+    if (!tip) return;
+    if (!g_tipAddLine)
+    {
+        void* base = GameBase();
+        if (!base) return;
+        g_tipAddLine = (ToolTipAddLineFn)((unsigned char*)base + 0x920ED0);
+    }
+    if (!g_tipAddLine) return;
+    GameStr a, b;
+    GameStrSet(&a, left ? left : "");
+    GameStrSet(&b, right ? right : "");
+    g_tipAddLine(tip, &a, &b);
+#endif
+}
+
+static void AppendOneLimbOntoToolTip(void* tip, CharStats* stats, int slot)
+{
+    if (!tip || !stats || slot < 0 || slot > 3) return;
+    LimbTip limbs[4];
+    int n = CollectLimbTips(stats, limbs, 4);
+    if (slot >= n) return;
+
+    const LimbTip& L = limbs[slot];
+    TipAddLine(tip, "--- Toughness Feast ---", "");
+    TipAddLine(tip, "Regrow stage", L.stage);
+    TipAddLine(tip, "Progress", L.detail);
+    {
+        float pwr = RegenPowerOf(stats);
+        char r[64];
+        if (pwr <= 0.f)
+            std::snprintf(r, sizeof(r), "Locked (need toughness)");
+        else if (L.active)
+            std::snprintf(r, sizeof(r), "Healing via food (pwr %.1f)", pwr);
+        else
+            std::snprintf(r, sizeof(r), "Idle (limb OK)");
+        TipAddLine(tip, "Food regen", r);
+    }
+    if (L.active)
+    {
+        float foodUse = FoodUsePercentPerSec(stats);
+        char r[64];
+        std::snprintf(r, sizeof(r), "~%.1f%% bar/sec if healing", foodUse);
+        TipAddLine(tip, "Food cost", r);
+    }
+}
+
+// void ToolTip::setup(Widget*, lektor<StringPair> const&)
+static void (*ToolTip_setup_lines_orig)(void* self, void* widget, const lektor<StringPair>* lines) = nullptr;
+static void ToolTip_setup_lines_hook(void* self, void* widget, const lektor<StringPair>* lines)
+{
+    if (ToolTip_setup_lines_orig)
+        ToolTip_setup_lines_orig(self, widget, lines);
+
+    if (!g_cfg.enableTooltips || !self || !lines) return;
+
+    int slot = DetectLimbSlotFromLektor(lines);
+    if (slot < 0) return;
+
+    CharStats* stats = g_lastStats;
+    if (!stats) return;
+
+    AppendOneLimbOntoToolTip(self, stats, slot);
+
+    static int s_limbTipOnce = 0;
+    if (!s_limbTipOnce)
+    {
+        char m[96];
+        std::snprintf(m, sizeof(m), "ToughnessFeast: limb tooltip slot=%d", slot);
+        DebugLog(m);
+        s_limbTipOnce = 1;
+    }
+}
+
+// void ToolTip::setup(Widget*, GameData*) — body-part GameData name
+static void (*ToolTip_setup_gd_orig)(void* self, void* widget, void* gameData) = nullptr;
+static void ToolTip_setup_gd_hook(void* self, void* widget, void* gameData)
+{
+    if (ToolTip_setup_gd_orig)
+        ToolTip_setup_gd_orig(self, widget, gameData);
+
+    if (!g_cfg.enableTooltips || !self || !gameData) return;
+    CharStats* stats = g_lastStats;
+    if (!stats) return;
+
+    // GameData::name @ 0x28, stringID @ 0x58
+    int slot = DetectLimbSlotFromText(ReadGameStrPtr((const char*)gameData + 0x28));
+    if (slot < 0)
+        slot = DetectLimbSlotFromText(ReadGameStrPtr((const char*)gameData + 0x58));
+    if (slot < 0) return;
+
+    AppendOneLimbOntoToolTip(self, stats, slot);
+}
+
 static int g_statusLogCooldown = 0;
 static int g_raceLogged = 0;
 
@@ -1264,10 +1440,12 @@ static bool getStatPenaltiesForGUI_hook(CharStats* self, const std::string& stat
         r = getStatPenaltiesForGUI_orig(self, statName, stat, dats);
     // Do not read statName (CRT ABI). Use enum only.
     // Never permanently block tooltips on regen flag (could stick after crash).
-    if (g_cfg.enableTooltips && self && stat == STAT_TOUGHNESS)
+    if (g_cfg.enableTooltips && self)
     {
-        g_inFoodRegen = 0; // safe: tooltips are not re-entered from regen
-        AppendToughnessTooltips(&dats, self);
+        g_lastStats = self;
+        g_inFoodRegen = 0;
+        if (stat == STAT_TOUGHNESS)
+            AppendToughnessTooltips(&dats, self);
     }
     return r;
 }
@@ -1278,7 +1456,10 @@ static void printExertionHungerMultTooltip_hook(CharStats* self, lektor<StringPa
     if (printExertionHungerMultTooltip_orig)
         printExertionHungerMultTooltip_orig(self, dats);
     if (g_cfg.enableTooltips && self && dats)
+    {
+        g_lastStats = self;
         AppendHungerTooltips(dats, self);
+    }
 }
 #endif
 
@@ -1356,6 +1537,31 @@ static int HookExport(const char* mangled, void* detour, void** original, const 
     return TryAddHook(real, detour, original, okMsg);
 }
 
+static void InstallLimbToolTipHooks()
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    return;
+#else
+    void* base = GameBase();
+    if (!base)
+    {
+        ErrorLog("ToughnessFeast: no game base for ToolTip hooks");
+        return;
+    }
+    // ToolTip::setup(Widget*, lektor const&) RVA 0x920AB0
+    TryAddHook((void*)((unsigned char*)base + 0x920AB0),
+               (void*)ToolTip_setup_lines_hook,
+               (void**)&ToolTip_setup_lines_orig,
+               "ToughnessFeast: hooked limb ToolTip lines");
+    // ToolTip::setup(Widget*, GameData*) RVA 0x91F970
+    TryAddHook((void*)((unsigned char*)base + 0x91F970),
+               (void*)ToolTip_setup_gd_hook,
+               (void**)&ToolTip_setup_gd_orig,
+               "ToughnessFeast: hooked limb ToolTip GameData");
+#endif
+}
+
+
 // Progressive enable via config — medical is highest risk during world load
 static void InstallHooks()
 {
@@ -1391,6 +1597,7 @@ static void InstallHooks()
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
     if (g_cfg.enableTooltips)
     {
+        InstallLimbToolTipHooks();
         // getStatPenaltiesForGUI — toughness (and other stats) hover
         HookExport(
             "?getStatPenaltiesForGUI@CharStats@@QEAA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@W4StatsEnumerated@@AEAV?$lektor@VStringPair@@@@@Z",
