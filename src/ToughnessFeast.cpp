@@ -119,9 +119,9 @@ static Config g_cfg = {
     1, 1, 1, 1, 1, 1,             // hooks/medical/limb/tooltips/penalty/debug
     100.f,                        // combatCap
     75.f, 50.f, 0.f,              // unlocks H/S/Hiv
-    0.045f, 0.022f, 3.0f,         // scale, hiver scale, power cap
-    1.35f, 0.9f, 0.012f, 0.15f, 1,// flesh, stun, hunger drain, minHunger, unhealable
-    0.085f, 0.40f, 0.12f, 0.18f, 0.70f, 0.40f, // regrow/bud/stumpForm/start/strong/overdmg
+    0.0045f, 0.0022f, 1.5f,       // scale, hiver scale, power cap (~90% less)
+    0.135f, 0.09f, 0.004f, 0.15f, 1,// flesh, stun, drain, minHunger, unhealable (~90% less)
+    0.0085f, 0.40f, 0.12f, 0.18f, 0.70f, 0.25f, // regrow/bud/stumpForm/start/strong/overdmg
     0.28f, 0.55f, 8.0f, 18.0f,    // stumpHunger, restoreHunger, stumpKO, restoreKO
     0.20f,                        // past100 xp
     0.88f, 0.90f, 0.92f, 0.90f,   // weak limb combat mults
