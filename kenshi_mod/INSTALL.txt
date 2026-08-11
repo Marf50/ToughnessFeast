@@ -1,0 +1,20 @@
+CRASH DUMP ANALYSIS
+===================
+Your dump: ACCESS_VIOLATION reading address 0x18 (null pointer + 0x18)
+during MyGUI UI init. That matches the older builds that hooked GUI and
+touched game std::string objects (VS2010 ABI mismatch).
+
+THIS package:
+- No GUI hooks
+- No game std::string access
+- No <fstream>
+- Static CRT (/MT), no VCRUNTIME140_1
+- Correct export ?startPlugin@@YAXXZ
+
+TEST ORDER
+1. Optional: rename ToughnessFeast_minimal.dll to test load:
+   In RE_Kenshi.json set "Plugins":["ToughnessFeast_minimal.dll"]
+   If log shows "MINIMAL: loaded OK" and game opens, load path is fine.
+2. Then use full ToughnessFeast.dll (default in RE_Kenshi.json).
+
+Enable ToughnessFeast + RE_Kenshi in Mods list.

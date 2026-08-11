@@ -479,42 +479,23 @@ static void ResolvePluginDir()
 #endif
 }
 
-#if defined(_MSC_VER)
 static int TryAddHook(void* target, void* detour, void** original, const char* name)
 {
-    __try
-    {
-        if (!target)
-        {
-            ErrorLog(name);
-            ErrorLog("ToughnessFeast: GetRealAddress returned null");
-            return 0;
-        }
-        if (KenshiLib::SUCCESS != KenshiLib::AddHook(target, detour, original))
-        {
-            ErrorLog(name);
-            ErrorLog("ToughnessFeast: AddHook failed");
-            return 0;
-        }
-        DebugLog(name);
-        return 1;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    if (!target)
     {
         ErrorLog(name);
-        ErrorLog("ToughnessFeast: exception during hook install");
+        ErrorLog("ToughnessFeast: GetRealAddress returned null");
         return 0;
     }
-}
-#else
-static int TryAddHook(void* target, void* detour, void** original, const char* name)
-{
-    if (!target) return 0;
-    if (KenshiLib::SUCCESS != KenshiLib::AddHook(target, detour, original)) return 0;
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(target, detour, original))
+    {
+        ErrorLog(name);
+        ErrorLog("ToughnessFeast: AddHook failed");
+        return 0;
+    }
     DebugLog(name);
     return 1;
 }
-#endif
 
 // RE_Kenshi: GetProcAddress(plugin, "?startPlugin@@YAXXZ") — C++ linkage required
 #if defined(_MSC_VER)
