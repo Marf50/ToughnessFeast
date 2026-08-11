@@ -1,45 +1,46 @@
-# ToughnessFeast
+TOUGHNESS FEAST  (RE_Kenshi plugin)
+====================================
 
-**RE_Kenshi** plugin for *Kenshi*: toughness past 100, combat bonuses soft-capped, food-powered flesh / limb regeneration.
+WHAT IT DOES
+  • Toughness still rises past 100.
+  • Combat DR / wound degen soft-cap at 100 (configurable).
+  • Excess toughness → Feast power: while FED, slowly
+      - regrow crushed / severed limbs (staged, slow)
+      - heal wounds that normally never self-heal
+      - paid for with hunger
+  • Race unlocks: Hiver ~0, Shek ~50, Human ~75
+  • Weak / missing limbs slightly hurt combat until mended
+  • Hover HUNGER for the Feast journal (all live stats)
 
-## Download the DLL (no Windows PC needed)
+INSTALL
+  1. Install RE_Kenshi for Kenshi.
+  2. Copy this whole folder to:
+       Kenshi/mods/ToughnessFeast/
+     so you have:
+       mods/ToughnessFeast/ToughnessFeast.dll
+       mods/ToughnessFeast/RE_Kenshi.json
+       mods/ToughnessFeast/config.ini
+       mods/ToughnessFeast/ToughnessFeast.mod
+  3. Enable the mod in the Kenshi launcher / mod list.
+  4. Launch. Check RE_Kenshi log for "ToughnessFeast: ready".
 
-1. Open the **[Actions](../../actions)** tab on this repo
-2. Open the latest green **Build Windows DLL** run
-3. Download the **`ToughnessFeast-mod`** artifact
-4. Copy contents into:
+HOW TO PLAY
+  • Train toughness (get hit, fight). Past 100 it still creeps up.
+  • Stay fed. Hover the Hunger bar — Feast journal shows unlock,
+    power, food use, and every limb stage.
+  • Missing arm/leg: stages = MISSING/budding → Fragile → Healing → OK
+  • Budding is intentionally slow. A full arm is a long-term recovery.
+  • Skeletons cannot feast.
 
-```text
-[Kenshi]/mods/ToughnessFeast/
-```
+CONFIG
+  Edit config.ini next to the DLL. All rates and unlocks are there.
+  Set EnableHooks=0 for load-only safe mode.
+  Set EnableTooltips=0 if tips ever misbehave (gameplay stays on).
+  Set DebugLog=0 to quiet the log.
 
-Linux / Proton example:
-
-```text
-~/.steam/steam/steamapps/common/Kenshi/mods/ToughnessFeast/
-```
-
-Enable **RE_Kenshi** + **ToughnessFeast** in the Mods menu.
-
-If Actions has not run yet: **Actions → Build Windows DLL → Run workflow**.
-
-## What the mod does
-
-| Toughness | Effect |
-| --- | --- |
-| 1–100 | Vanilla DR & wound degen |
-| ≥ 75 (configurable) | Food-powered regen of flesh, stun, and normally unhealable wounds |
-| > 100 | Combat bonuses **stop** scaling; extra toughness only deepens food regen |
-
-Edit `config.ini` after install.
-
-## Build locally (Windows MSVC)
-
-See `NO_WINDOWS_PC.md` and `OPEN_IN_CLION.md`. Requires [KenshiLib_Examples_deps](https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps) with Git LFS.
-
-## Requirements
-
-- [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847) 0.3.1+
-- Kenshi (Steam)
-
-Not affiliated with Lo-Fi Games.
+SAFE BY DESIGN
+  • No medical writes on the hit / DR path (no mid-combat setLimb)
+  • Toughness via getStat (never mis-reads Strength)
+  • Race via getRace() virtual (never bad myRace offset)
+  • setLimb only at bud→restore; part pointer always re-fetched
+  • SEH around race / tip / regrow
