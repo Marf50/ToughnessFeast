@@ -286,47 +286,67 @@ static RaceData* RaceFromStats(CharStats* stats)
 {
     Character* me = CharFromStats(stats);
     if (!me) return nullptr;
-    // Prefer POD field myRace (no virtual); fall back to getRace()
-    RaceData* race = me->myRace;
-    if (!race) race = me->getRace();
+    // Do NOT read me->myRace: Character "hand" size mismatch in headers puts
+    // myRace at 0x2D0 in our build vs 0x2E0 in game → garbage pointer → AV at race+0x7c.
+    // Always use virtual getRace() (RVA via vtable).
+    RaceData* race = me->getRace();
     return race;
 }
 
 static RaceKind DetectRaceKind(CharStats* stats)
 {
+    if (!stats) return RACE_UNKNOWN;
+#if defined(_MSC_VER)
+    __try
+    {
+#endif
     RaceData* race = RaceFromStats(stats);
     if (!race) return RACE_UNKNOWN;
+
+    // Validate race pointer roughly (reject low/null-ish)
+    {
+        uintptr_t rp = (uintptr_t)race;
+        if (rp < 0x10000ull) return RACE_UNKNOWN;
+    }
+
     if (race->robot) return RACE_ROBOT;
     if (race->gigantic) return RACE_SHEK;
 
-    // GameData::name @ 0x28, stringID @ 0x58 (KenshiLib header)
     if (race->data)
     {
         const char* base = (const char*)race->data;
-        // hive worker / soldier / prince / southern hive etc.
-        if (MsvcStringContains(base + 0x58, "hive") ||
-            MsvcStringContains(base + 0x28, "hive") ||
-            MsvcStringContains(base + 0x58, "hiver") ||
-            MsvcStringContains(base + 0x28, "hiver"))
-            return RACE_HIVER;
-        if (MsvcStringContains(base + 0x58, "shek") ||
-            MsvcStringContains(base + 0x28, "shek"))
-            return RACE_SHEK;
-        if (MsvcStringContains(base + 0x58, "skeleton") ||
-            MsvcStringContains(base + 0x28, "skeleton"))
-            return RACE_ROBOT;
+        uintptr_t bp = (uintptr_t)base;
+        if (bp > 0x10000ull)
+        {
+            if (MsvcStringContains(base + 0x58, "hive") ||
+                MsvcStringContains(base + 0x28, "hive") ||
+                MsvcStringContains(base + 0x58, "hiver") ||
+                MsvcStringContains(base + 0x28, "hiver"))
+                return RACE_HIVER;
+            if (MsvcStringContains(base + 0x58, "shek") ||
+                MsvcStringContains(base + 0x28, "shek"))
+                return RACE_SHEK;
+            if (MsvcStringContains(base + 0x58, "skeleton") ||
+                MsvcStringContains(base + 0x28, "skeleton"))
+                return RACE_ROBOT;
+        }
     }
 
-    // POD fallbacks (hive races often lack hats/shoes)
     if (race->noHats && (race->noShoes || race->noShirts))
         return RACE_HIVER;
     if (race->singleGender && race->hungerRate > 1.0f)
         return RACE_HIVER;
-    // lower threshold than before — many hivers ~1.0–1.2
     if (race->hungerRate > 1.05f)
         return RACE_HIVER;
 
     return RACE_HUMAN;
+#if defined(_MSC_VER)
+    }
+    __except (1)
+    {
+        return RACE_UNKNOWN;
+    }
+#endif
 }
 
 static const char* RaceKindName(RaceKind k)
@@ -517,14 +537,11 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
     MedicalSystem* med = stats->medical;
     if (!med) return 0;
 
-    // KenshiLib MedicalSystem limb pointers @ 0x80/88/90/98
-    // Read raw so we do not depend on IDE stub fields / robotLimbs.
-    MedicalSystem::HealthPartStatus* parts[4] = { nullptr, nullptr, nullptr, nullptr };
-    std::memcpy(&parts[2], (const char*)(void*)med + 0x80, sizeof(void*)); // leftLeg
-    std::memcpy(&parts[3], (const char*)(void*)med + 0x88, sizeof(void*)); // rightLeg
-    std::memcpy(&parts[0], (const char*)(void*)med + 0x90, sizeof(void*)); // leftArm
-    std::memcpy(&parts[1], (const char*)(void*)med + 0x98, sizeof(void*)); // rightArm
-
+#if defined(_MSC_VER)
+    __try
+    {
+#endif
+    // Prefer getPart(enum) — safer than raw limb pointer offsets
     static const RobotLimbs::Limb kLimbs[4] = {
         RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
         RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
@@ -534,16 +551,23 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
     int n = 0;
     for (int i = 0; i < 4 && n < maxOut; ++i)
     {
-        MedicalSystem::HealthPartStatus* part = parts[i];
-        // Fall back to getPart(enum) if pointer null/bad
+        MedicalSystem::HealthPartStatus* part = med->getPart(kLimbs[i]);
+        // Fallback raw pointers only if getPart null
         if (!part)
-            part = med->getPart(kLimbs[i]);
+        {
+            MedicalSystem::HealthPartStatus* raw = nullptr;
+            // leftArm 0x90, rightArm 0x98, leftLeg 0x80, rightLeg 0x88
+            static const int kOff[4] = { 0x90, 0x98, 0x80, 0x88 };
+            std::memcpy(&raw, (const char*)(void*)med + kOff[i], sizeof(raw));
+            if (raw && (uintptr_t)raw > 0x10000ull)
+                part = raw;
+        }
 
         LimbTip& tip = out[n];
         std::memset(&tip, 0, sizeof(tip));
         std::snprintf(tip.name, sizeof(tip.name), "%s", kNames[i]);
 
-        if (!part)
+        if (!part || (uintptr_t)part < 0x10000ull)
         {
             std::snprintf(tip.stage, sizeof(tip.stage), "n/a");
             std::snprintf(tip.detail, sizeof(tip.detail), "-");
@@ -591,7 +615,6 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
         }
         else
         {
-            // Always list ORIGINAL limbs so all 4 appear
             if (pct < g_cfg.limbRestoredStartPct + 0.08f)
             {
                 std::snprintf(tip.stage, sizeof(tip.stage), "Fragile");
@@ -614,6 +637,13 @@ static int CollectLimbTips(CharStats* stats, LimbTip* out, int maxOut)
         ++n;
     }
     return n;
+#if defined(_MSC_VER)
+    }
+    __except (1)
+    {
+        return 0;
+    }
+#endif
 }
 
 // Toughness hover: overview only (easy to scan)
@@ -1350,14 +1380,25 @@ static void printExertionHungerMultTooltip_hook(CharStats* self, lektor<StringPa
         printExertionHungerMultTooltip_orig(self, dats);
 
     if (!g_cfg.enableTooltips || !self || !dats) return;
-    // Sanity: lektor must look like a real game container
     if (!dats->stuff) return;
     if (dats->maxSize == 0 || dats->maxSize > 256) return;
     if (dats->count > dats->maxSize) return;
-    if (g_inFoodRegen) return; // never nest with regen writes
+    if (g_inFoodRegen) return;
 
     g_lastStats = self;
-    AppendFullTfTooltips(dats, self);
+#if defined(_MSC_VER)
+    __try
+    {
+#endif
+        AppendFullTfTooltips(dats, self);
+#if defined(_MSC_VER)
+    }
+    __except (1)
+    {
+        static int s_once = 0;
+        if (!s_once) { ErrorLog("ToughnessFeast: tooltip SEH caught"); s_once = 1; }
+    }
+#endif
 }
 #endif
 
