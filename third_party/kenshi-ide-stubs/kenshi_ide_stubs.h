@@ -131,3 +131,10 @@ public:
 };
 template<class F> inline F newDelegate(F f){return f;}
 }
+
+class StringPair { public: StringPair(){} StringPair(const std::string&, const std::string&){} };
+template<typename T> class lektor {
+public:
+  unsigned count=0, maxSize=0;
+  T* stuff=nullptr;
+};

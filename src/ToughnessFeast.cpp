@@ -26,14 +26,8 @@
 #include <kenshi/Enums.h>
 #include <kenshi/RaceData.h>
 #include <kenshi/GameData.h>
-#include <mygui/MyGUI_Gui.h>
-#include <mygui/MyGUI_Window.h>
-#include <mygui/MyGUI_EditBox.h>
-#include <mygui/MyGUI_TextBox.h>
-#include <mygui/MyGUI_Button.h>
-#include <mygui/MyGUI_UString.h>
-#include <mygui/MyGUI_Delegate.h>
-#include <mygui/MyGUI_Colour.h>
+#include <kenshi/util/StringPair.h>
+#include <kenshi/util/lektor.h>
 #endif
 
 #include <cstdint>
@@ -82,8 +76,7 @@ struct Config
     int enableHooks;
     int enableMedicalHooks;         // food/limb regen (not medicalUpdate hook)
     int enableLimbRestore;          // setLimb staged restore
-    int showStatusHud;              // deferred MyGUI panel (safe delay)
-    int hudDelayTicks;              // CharStats ticks before first HUD create
+    int enableTooltips;             // append TF lines to toughness/hunger tooltips
 };
 
 static Config g_cfg = {
@@ -108,8 +101,7 @@ static Config g_cfg = {
     1,       // enableHooks
     1,       // enableMedicalHooks
     1,       // enableLimbRestore
-    1,       // showStatusHud (deferred create)
-    120      // hudDelayTicks ~ many seconds after in-world
+    1        // enableTooltips
 };
 
 static char g_pluginDir[MAX_PATH] = { 0 };
@@ -207,8 +199,9 @@ static void LoadConfig()
         else if (std::strcmp(key, "LimbRestoredStartPct") == 0) g_cfg.limbRestoredStartPct = (float)std::atof(val);
         else if (std::strcmp(key, "LimbStrongPct") == 0) g_cfg.limbStrongPct = (float)std::atof(val);
         else if (std::strcmp(key, "EnableLimbRestore") == 0) g_cfg.enableLimbRestore = ParseBoolC(val);
-        else if (std::strcmp(key, "ShowStatusHud") == 0) g_cfg.showStatusHud = ParseBoolC(val);
-        else if (std::strcmp(key, "HudDelayTicks") == 0) g_cfg.hudDelayTicks = (int)std::atoi(val);
+        else if (std::strcmp(key, "EnableTooltips") == 0) g_cfg.enableTooltips = ParseBoolC(val);
+        else if (std::strcmp(key, "ShowStatusHud") == 0) { /* deprecated GUI removed */ }
+        else if (std::strcmp(key, "HudDelayTicks") == 0) { /* deprecated */ }
         else if (std::strcmp(key, "EnableMedicalHooks") == 0) g_cfg.enableMedicalHooks = ParseBoolC(val);
         else if (std::strcmp(key, "EnableAnatomyPass") == 0) { /* deprecated */ }
         else if (std::strcmp(key, "Past100XpMult") == 0) g_cfg.past100XpMult = (float)std::atof(val);
@@ -366,313 +359,302 @@ static float FoodRegenScaleFor(CharStats* stats)
 }
 
 // ---------------------------------------------------------------------------
-// Status text + deferred MyGUI menu (create only after long in-world delay)
+// Tooltips (no MyGUI window) — append lines into game lektor<StringPair>
+// Uses raw MSVC-layout short strings + game StringPair ctor (avoids CRT ABI).
 // ---------------------------------------------------------------------------
 
-static char g_statusText[2048] = "ToughnessFeast";
-static CharStats* g_lastStats = nullptr;
-static int g_statusLogCooldown = 0;
-static int g_worldTicks = 0;
-static int g_raceLogged = 0;
-
-static int g_hudFailed = 0;
-static int g_hudUserClosed = 0;
-#if !defined(TOUGHNESSFEAST_LINUX_IDE)
-static MyGUI::Window* g_hudWindow = nullptr;
-static MyGUI::Button* g_hudCloseBtn = nullptr;
-static const int kHudLines = 14;
-static MyGUI::TextBox* g_hudLines[kHudLines] = {};
-#endif
-
-static const char* LimbSlotName(int i)
+// MSVC x64 SSO string layout (16-byte buffer, size@16, capacity@24)
+struct GameStr
 {
-    static const char* n[4] = { "L.Arm", "R.Arm", "L.Leg", "R.Leg" };
-    return (i >= 0 && i < 4) ? n[i] : "?";
-}
+    char buf[16];
+    size_t size;
+    size_t cap;
+};
 
-static void BuildStatusText(CharStats* stats)
+static void GameStrSet(GameStr* s, const char* text)
 {
-    if (!stats)
-    {
-        std::snprintf(g_statusText, sizeof(g_statusText), "ToughnessFeast (no character)");
-        return;
-    }
-
-    RaceKind rk = DetectRaceKind(stats);
-    float tough = stats->_toughness;
-    float start = FoodRegenStartFor(stats);
-    float power = 0.f;
-    float excess = tough - start;
-    if (excess > 0.f && start < 9000.f)
-    {
-        power = excess * FoodRegenScaleFor(stats);
-        if (power > 3.5f) power = 3.5f;
-    }
-
-    MedicalSystem* med = stats->medical;
-    float hunger = (med && med->hunger >= 0.f && med->hunger <= 5.f) ? med->hunger : -1.f;
-
-    // one-time race debug
-    if (g_cfg.debugLog && !g_raceLogged)
-    {
-        RaceData* race = RaceFromStats(stats);
-        char msg[256];
-        if (race)
-            std::snprintf(msg, sizeof(msg),
-                "ToughnessFeast: race=%s hungerRate=%.2f giant=%d noHats=%d unlock=%.0f",
-                RaceKindName(rk), race->hungerRate, race->gigantic ? 1 : 0,
-                race->noHats ? 1 : 0, start);
-        else
-            std::snprintf(msg, sizeof(msg), "ToughnessFeast: race=%s (no RaceData)", RaceKindName(rk));
-        DebugLog(msg);
-        g_raceLogged = 1;
-    }
-
-    char lines[1900];
-    int off = 0;
-    #define APP(...) do { int _n = std::snprintf(lines + off, sizeof(lines) - (size_t)off, __VA_ARGS__); if (_n > 0) off += _n; if (off >= (int)sizeof(lines)) off = (int)sizeof(lines) - 1; } while (0)
-
-    APP("=== Toughness Feast ===\n");
-    APP("Race: %s   Tough: %.1f\n", RaceKindName(rk), tough);
-    APP("Unlock: %.0f   Power: %.2f\n", start, power);
-    if (hunger >= 0.f)
-        APP("Hunger: %.0f%%  %s\n", hunger * 100.f,
-            (hunger >= g_cfg.minHungerToRegen && power > 0.f) ? "REGEN ON" : "waiting");
-    APP("Combat softcap: %.0f\n", g_cfg.combatCapToughness);
-    APP("-- Limbs --\n");
-
-    if (med && med->robotLimbs)
-    {
-        static const RobotLimbs::Limb kLimbs[4] = {
-            RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
-            RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
-        };
-        for (int i = 0; i < 4; ++i)
-        {
-            MedicalSystem::HealthPartStatus* part = med->getPart(kLimbs[i]);
-            if (!part) { APP("%s: ?\n", LimbSlotName(i)); continue; }
-            if (part->isRobotic()) { APP("%s: prosthetic\n", LimbSlotName(i)); continue; }
-            LimbState st = part->getRobotLimbState();
-            float maxHp = part->maxHealth();
-            if (maxHp < 1.f) maxHp = part->_maxHealth;
-            if (maxHp < 1.f) maxHp = 100.f;
-            float flesh = part->flesh;
-            if (flesh < 0.f) flesh = 0.f;
-            float pct = flesh / maxHp;
-
-            if (st == LIMB_STUMP || st == LIMB_CRUSHED)
-            {
-                float prog = (g_cfg.limbBudThreshold > 0.01f) ? (pct / g_cfg.limbBudThreshold) * 100.f : 0.f;
-                if (prog > 100.f) prog = 100.f;
-                int bars = (int)(prog / 10.f); if (bars > 10) bars = 10;
-                char bar[12]; for (int b=0;b<10;b++) bar[b] = (b<bars)?'#':'.'; bar[10]=0;
-                APP("%s: %s [%s] %.0f%%->restore\n", LimbSlotName(i),
-                    st == LIMB_CRUSHED ? "CRUSH" : "STUMP", bar, prog);
-            }
-            else if (st == LIMB_ORIGINAL && pct < g_cfg.limbStrongPct)
-            {
-                float lo = g_cfg.limbRestoredStartPct, hi = g_cfg.limbStrongPct;
-                float prog = (hi > lo) ? ((pct - lo) / (hi - lo)) * 100.f : 0.f;
-                if (prog < 0.f) prog = 0.f; if (prog > 100.f) prog = 100.f;
-                int bars = (int)(prog / 10.f); if (bars > 10) bars = 10;
-                char bar[12]; for (int b=0;b<10;b++) bar[b] = (b<bars)?'#':'.'; bar[10]=0;
-                APP("%s: WEAK  HP%.0f%% [%s]\n", LimbSlotName(i), pct * 100.f, bar);
-            }
-            else if (st == LIMB_REPLACED)
-                APP("%s: replaced\n", LimbSlotName(i));
-            else
-                APP("%s: OK  HP%.0f%%\n", LimbSlotName(i), pct * 100.f);
-        }
-    }
-    else
-        APP("(limb data n/a)\n");
-    #undef APP
-    std::snprintf(g_statusText, sizeof(g_statusText), "%s", lines);
-}
-
-#if !defined(TOUGHNESSFEAST_LINUX_IDE)
-static void OnHudCloseClick(MyGUI::Widget* /*sender*/)
-{
-    g_hudUserClosed = 1;
-    if (g_hudWindow)
-        g_hudWindow->setVisible(false);
-    DebugLog("ToughnessFeast: status menu closed by user");
-}
-
-// Paint status as separate single-line labels (EditBox multi-line was blank in Kenshi)
-static void ApplyHudText()
-{
-    if (!g_hudWindow) return;
-
-    // Split g_statusText into lines
-    const char* s = g_statusText;
-    int line = 0;
-    while (*s && line < kHudLines)
-    {
-        char buf[160];
-        int n = 0;
-        while (s[n] && s[n] != '\n' && n < 150) ++n;
-        if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
-        std::memcpy(buf, s, (size_t)n);
-        buf[n] = 0;
-        if (g_hudLines[line])
-        {
-            g_hudLines[line]->setCaption(MyGUI::UString(buf));
-            g_hudLines[line]->setTextColour(MyGUI::Colour(0.95f, 0.96f, 0.80f));
-            g_hudLines[line]->setVisible(true);
-        }
-        s += n;
-        if (*s == '\n') ++s;
-        ++line;
-    }
-    // hide unused lines
-    for (; line < kHudLines; ++line)
-    {
-        if (g_hudLines[line])
-            g_hudLines[line]->setVisible(false);
-    }
-
-    // Title shows race/toughness summary (always readable)
-    char title[96];
+    std::memset(s, 0, sizeof(*s));
+    s->cap = 15;
+    if (!text) return;
     size_t n = 0;
-    while (g_statusText[n] && g_statusText[n] != '\n' && n < 70) ++n;
-    // prefer second line if first is banner
-    const char* t2 = g_statusText;
-    if (std::strncmp(g_statusText, "===", 3) == 0)
-    {
-        t2 = g_statusText;
-        while (*t2 && *t2 != '\n') ++t2;
-        if (*t2 == '\n') ++t2;
-        n = 0;
-        while (t2[n] && t2[n] != '\n' && n < 70) ++n;
-        std::snprintf(title, sizeof(title), "TF | %.*s", (int)n, t2);
-    }
-    else
-        std::snprintf(title, sizeof(title), "TF | %.*s", (int)n, g_statusText);
-    g_hudWindow->setCaption(MyGUI::UString(title));
+    while (text[n] && n < 15) ++n;
+    std::memcpy(s->buf, text, n);
+    s->buf[n] = 0;
+    s->size = n;
 }
-#endif
 
-static void TryCreateStatusMenu()
+// StringPair layout (vtable + two strings + float) — game size ~0x60
+// Call kenshi.exe StringPair::StringPair(string const&, string const&) RVA 0xF32C0
+typedef void* (*StringPairCtorFn)(void* self, const GameStr* a, const GameStr* b);
+
+static StringPairCtorFn g_spCtor = nullptr;
+
+static void ResolveStringPairCtor()
 {
 #if defined(TOUGHNESSFEAST_LINUX_IDE)
     return;
 #else
-    if (!g_cfg.showStatusHud) return;
-    if (g_hudUserClosed) return;
-    if (g_hudWindow || g_hudFailed) return;
-    if (g_worldTicks < g_cfg.hudDelayTicks) return;
-
-    MyGUI::Gui* gui = MyGUI::Gui::getInstancePtr();
-    if (!gui) return;
-
-    // Match KillButton skin/layer exactly (known working)
-    g_hudWindow = gui->createWidgetReal<MyGUI::Window>(
-        "Kenshi_WindowCX",
-        0.66f, 0.05f, 0.32f, 0.48f,
-        MyGUI::Align::Default,
-        "Window",
-        "ToughnessFeastHud");
-    if (!g_hudWindow)
-    {
-        g_hudFailed = 1;
-        ErrorLog("ToughnessFeast: HUD window create failed");
-        return;
-    }
-
-    g_hudWindow->setCaption(MyGUI::UString("Toughness Feast"));
-    g_hudWindow->setVisible(true);
-    g_hudWindow->setEnabled(true);
-
-    MyGUI::Widget* client = g_hudWindow->getClientWidget();
-    if (!client) client = g_hudWindow;
-
-    // Close button — top right of client area
-    g_hudCloseBtn = client->createWidgetReal<MyGUI::Button>(
-        "Kenshi_Button1",
-        0.70f, 0.01f, 0.28f, 0.07f,
-        MyGUI::Align::Default,
-        "TfHudClose");
-    if (g_hudCloseBtn)
-    {
-        g_hudCloseBtn->setCaption(MyGUI::UString("Close"));
-        g_hudCloseBtn->setVisible(true);
-        g_hudCloseBtn->eventMouseButtonClick += MyGUI::newDelegate(OnHudCloseClick);
-    }
-
-    // One TextBox per line (reliable)
-    for (int i = 0; i < kHudLines; ++i)
-    {
-        float y = 0.09f + (float)i * 0.062f;
-        g_hudLines[i] = client->createWidgetReal<MyGUI::TextBox>(
-            "TextBox",
-            0.03f, y, 0.94f, 0.06f,
-            MyGUI::Align::Default,
-            (std::string("TfHudL") + std::to_string(i)).c_str());
-        if (!g_hudLines[i])
-        {
-            g_hudLines[i] = client->createWidgetReal<MyGUI::TextBox>(
-                "Kenshi_TextBox",
-                0.03f, y, 0.94f, 0.06f,
-                MyGUI::Align::Default,
-                (std::string("TfHudLK") + std::to_string(i)).c_str());
-        }
-        if (g_hudLines[i])
-        {
-            g_hudLines[i]->setVisible(true);
-            g_hudLines[i]->setTextColour(MyGUI::Colour(0.95f, 0.96f, 0.80f));
-            g_hudLines[i]->setCaption(MyGUI::UString("..."));
-        }
-    }
-
-    if (g_lastStats)
-        BuildStatusText(g_lastStats);
-    else
-        std::snprintf(g_statusText, sizeof(g_statusText),
-            "=== Toughness Feast ===\n"
-            "Loading character stats...\n"
-            "Select a squad member.\n"
-            "Click Close to hide this panel.\n");
-
-    ApplyHudText();
-    DebugLog("ToughnessFeast: status menu created (line labels + Close)");
+    if (g_spCtor) return;
+    HMODULE exe = GetModuleHandleA(nullptr);
+    if (!exe) exe = GetModuleHandleA("kenshi_GOG_x64.exe");
+    if (!exe) exe = GetModuleHandleA("kenshi_x64.exe");
+    if (!exe) return;
+    // RVA from KenshiLib headers for StringPair(string,string)
+    g_spCtor = (StringPairCtorFn)((unsigned char*)exe + 0xF32C0);
 #endif
 }
 
-static void RefreshStatusHud(CharStats* preferStats)
+static int LektorAppendPair(lektor<StringPair>* dats, const char* left, const char* right)
 {
-    CharStats* stats = preferStats ? preferStats : g_lastStats;
-    if (stats) g_lastStats = stats;
-    if (!stats) return;
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    (void)dats; (void)left; (void)right;
+    return 0;
+#else
+    if (!dats || !left || !right) return 0;
+    if (!dats->stuff) return 0;
+    if (dats->count >= dats->maxSize) return 0;
+    ResolveStringPairCtor();
+    if (!g_spCtor) return 0;
 
-    ++g_worldTicks;
-    BuildStatusText(stats);
+    GameStr a, b;
+    GameStrSet(&a, left);
+    GameStrSet(&b, right);
 
-    if (g_cfg.debugLog)
+    // Game StringPair size (vtable + 2x strings + float + pad) — do NOT use
+    // sizeof(StringPair) from our CRT headers (layout can differ).
+    static const size_t kGameStringPairSize = 0x60;
+    void* slot = (char*)(void*)dats->stuff + (size_t)dats->count * kGameStringPairSize;
+    std::memset(slot, 0, kGameStringPairSize);
+    g_spCtor(slot, &a, &b);
+    dats->count += 1;
+    return 1;
+#endif
+}
+
+// Limb stage one-liner for tooltips (max 15 chars per side — use short labels)
+static void DescribeLimbShort(MedicalSystem* med, int slot, char* left, size_t ln, char* right, size_t rn)
+{
+    left[0] = 0; right[0] = 0;
+    if (!med || !med->robotLimbs) return;
+    static const RobotLimbs::Limb kLimbs[4] = {
+        RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
+        RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
+    };
+    static const char* kNames[4] = { "L.Arm", "R.Arm", "L.Leg", "R.Leg" };
+    if (slot < 0 || slot > 3) return;
+    MedicalSystem::HealthPartStatus* part = med->getPart(kLimbs[slot]);
+    if (!part) { std::snprintf(left, ln, "%s", kNames[slot]); std::snprintf(right, rn, "n/a"); return; }
+    if (part->isRobotic()) { std::snprintf(left, ln, "%s", kNames[slot]); std::snprintf(right, rn, "prosthetic"); return; }
+
+    LimbState st = part->getRobotLimbState();
+    float maxHp = part->maxHealth();
+    if (maxHp < 1.f) maxHp = part->_maxHealth;
+    if (maxHp < 1.f) maxHp = 100.f;
+    float flesh = part->flesh;
+    if (flesh < 0.f) flesh = 0.f;
+    float pct = flesh / maxHp * 100.f;
+
+    std::snprintf(left, ln, "%s", kNames[slot]);
+    if (st == LIMB_STUMP)
+        std::snprintf(right, rn, "BUD %.0f%%", (g_cfg.limbBudThreshold > 0.01f) ? (pct / (g_cfg.limbBudThreshold * 100.f) * 100.f) : pct);
+    else if (st == LIMB_CRUSHED)
+        std::snprintf(right, rn, "CRUSH bud");
+    else if (st == LIMB_REPLACED)
+        std::snprintf(right, rn, "replaced");
+    else if (pct < g_cfg.limbStrongPct * 100.f)
+        std::snprintf(right, rn, "WEAK %.0f%%", pct);
+    else
+        std::snprintf(right, rn, "OK %.0f%%", pct);
+}
+
+// Longer description lines (split across multiple short pairs)
+static void AppendLimbStageTooltips(lektor<StringPair>* dats, CharStats* stats)
+{
+    if (!dats || !stats) return;
+    MedicalSystem* med = stats->medical;
+    if (!med) return;
+
+    LektorAppendPair(dats, "-- TF limbs --", "food regrow");
+
+    static const RobotLimbs::Limb kLimbs[4] = {
+        RobotLimbs::LEFT_ARM, RobotLimbs::RIGHT_ARM,
+        RobotLimbs::LEFT_LEG, RobotLimbs::RIGHT_LEG
+    };
+    static const char* kNames[4] = { "L Arm", "R Arm", "L Leg", "R Leg" };
+
+    if (!med->robotLimbs)
     {
-        if (++g_statusLogCooldown >= 30)
-        {
-            g_statusLogCooldown = 0;
-            RaceKind rk = DetectRaceKind(stats);
-            char shortLog[256];
-            float un = FoodRegenStartFor(stats);
-            float pwr = 0.f;
-            if (stats->_toughness > un && un < 9000.f)
-                pwr = (stats->_toughness - un) * FoodRegenScaleFor(stats);
-            std::snprintf(shortLog, sizeof(shortLog),
-                "TF [%s] t=%.1f unlock=%.0f p=%.2f",
-                RaceKindName(rk), stats->_toughness, un, pwr);
-            DebugLog(shortLog);
-        }
+        LektorAppendPair(dats, "limbs", "unavailable");
+        return;
     }
 
-    if (!g_cfg.showStatusHud) return;
-    if (g_hudUserClosed) return; // do not force re-open
+    for (int i = 0; i < 4; ++i)
+    {
+        MedicalSystem::HealthPartStatus* part = med->getPart(kLimbs[i]);
+        if (!part) continue;
+        if (part->isRobotic())
+        {
+            LektorAppendPair(dats, kNames[i], "prosthetic");
+            continue;
+        }
+        LimbState st = part->getRobotLimbState();
+        float maxHp = part->maxHealth();
+        if (maxHp < 1.f) maxHp = part->_maxHealth;
+        if (maxHp < 1.f) maxHp = 100.f;
+        float flesh = part->flesh;
+        if (flesh < 0.f) flesh = 0.f;
+        float pct = flesh / maxHp;
 
-    TryCreateStatusMenu();
-#if !defined(TOUGHNESSFEAST_LINUX_IDE)
-    ApplyHudText();
-#endif
+        if (st == LIMB_STUMP || st == LIMB_CRUSHED)
+        {
+            float prog = (g_cfg.limbBudThreshold > 0.01f) ? (pct / g_cfg.limbBudThreshold) : 0.f;
+            if (prog > 1.f) prog = 1.f;
+            char r[16];
+            std::snprintf(r, sizeof(r), "%s %.0f%%", st == LIMB_CRUSHED ? "crush" : "stump", prog * 100.f);
+            LektorAppendPair(dats, kNames[i], r);
+            // stage description (short)
+            if (prog < 0.5f)
+                LektorAppendPair(dats, " stage", "budding");
+            else if (prog < 0.98f)
+                LektorAppendPair(dats, " stage", "almost");
+            else
+                LektorAppendPair(dats, " stage", "restore!");
+        }
+        else if (st == LIMB_ORIGINAL)
+        {
+            if (pct < g_cfg.limbRestoredStartPct + 0.05f)
+            {
+                char r[16];
+                std::snprintf(r, sizeof(r), "new %.0f%%", pct * 100.f);
+                LektorAppendPair(dats, kNames[i], r);
+                LektorAppendPair(dats, " stage", "fragile");
+            }
+            else if (pct < g_cfg.limbStrongPct)
+            {
+                char r[16];
+                std::snprintf(r, sizeof(r), "weak %.0f%%", pct * 100.f);
+                LektorAppendPair(dats, kNames[i], r);
+                LektorAppendPair(dats, " stage", "mending");
+            }
+            else
+            {
+                char r[16];
+                std::snprintf(r, sizeof(r), "OK %.0f%%", pct * 100.f);
+                LektorAppendPair(dats, kNames[i], r);
+            }
+        }
+        else if (st == LIMB_REPLACED)
+            LektorAppendPair(dats, kNames[i], "replaced");
+    }
+}
+
+static void AppendToughnessTooltips(lektor<StringPair>* dats, CharStats* stats)
+{
+    if (!dats || !stats) return;
+    RaceKind rk = DetectRaceKind(stats);
+    float un = FoodRegenStartFor(stats);
+    float tough = stats->_toughness;
+    float pwr = 0.f;
+    if (tough > un && un < 9000.f)
+        pwr = (tough - un) * FoodRegenScaleFor(stats);
+    if (pwr > 3.5f) pwr = 3.5f;
+
+    LektorAppendPair(dats, "-- ToughnessFeast --", "---");
+    {
+        char r[16];
+        std::snprintf(r, sizeof(r), "%s", RaceKindName(rk));
+        LektorAppendPair(dats, "race", r);
+    }
+    {
+        char r[16];
+        std::snprintf(r, sizeof(r), "%.0f tgh", un);
+        LektorAppendPair(dats, "food unlock", r);
+    }
+    {
+        char r[16];
+        std::snprintf(r, sizeof(r), "%.2f", pwr);
+        LektorAppendPair(dats, "regen power", r);
+    }
+    {
+        char r[16];
+        std::snprintf(r, sizeof(r), "%.0f cap", g_cfg.combatCapToughness);
+        LektorAppendPair(dats, "combat DR", r);
+    }
+    if (pwr <= 0.f)
+        LektorAppendPair(dats, "status", "locked");
+    else
+        LektorAppendPair(dats, "status", "active");
+
+    AppendLimbStageTooltips(dats, stats);
+}
+
+static void AppendHungerTooltips(lektor<StringPair>* dats, CharStats* stats)
+{
+    if (!dats || !stats) return;
+    float un = FoodRegenStartFor(stats);
+    float tough = stats->_toughness;
+    float pwr = 0.f;
+    if (tough > un && un < 9000.f)
+        pwr = (tough - un) * FoodRegenScaleFor(stats);
+
+    LektorAppendPair(dats, "-- TF food --", "---");
+    if (pwr <= 0.f)
+    {
+        char r[16];
+        std::snprintf(r, sizeof(r), "need %.0f", un);
+        LektorAppendPair(dats, "limb regen", r);
+    }
+    else
+    {
+        char r[16];
+        std::snprintf(r, sizeof(r), "pwr %.2f", pwr);
+        LektorAppendPair(dats, "limb regen", r);
+        LektorAppendPair(dats, "uses food", "to regrow");
+    }
+    AppendLimbStageTooltips(dats, stats);
+}
+
+// Still build short log line (no GUI)
+static CharStats* g_lastStats = nullptr;
+static int g_statusLogCooldown = 0;
+static int g_raceLogged = 0;
+
+static void MaybeLogStatus(CharStats* stats)
+{
+    if (!stats || !g_cfg.debugLog) return;
+    if (!g_raceLogged)
+    {
+        RaceData* race = RaceFromStats(stats);
+        RaceKind rk = DetectRaceKind(stats);
+        char msg[256];
+        if (race)
+            std::snprintf(msg, sizeof(msg),
+                "ToughnessFeast: race=%s hungerRate=%.2f unlock=%.0f",
+                RaceKindName(rk), race->hungerRate, FoodRegenStartFor(stats));
+        else
+            std::snprintf(msg, sizeof(msg), "ToughnessFeast: race=%s", RaceKindName(rk));
+        DebugLog(msg);
+        g_raceLogged = 1;
+    }
+    if (++g_statusLogCooldown < 40) return;
+    g_statusLogCooldown = 0;
+    RaceKind rk = DetectRaceKind(stats);
+    char shortLog[192];
+    float un = FoodRegenStartFor(stats);
+    float pwr = 0.f;
+    if (stats->_toughness > un && un < 9000.f)
+        pwr = (stats->_toughness - un) * FoodRegenScaleFor(stats);
+    std::snprintf(shortLog, sizeof(shortLog),
+        "TF [%s] t=%.1f unlock=%.0f p=%.2f",
+        RaceKindName(rk), stats->_toughness, un, pwr);
+    DebugLog(shortLog);
+}
+
+// Lightweight refresh used by combat hooks (log only)
+static void RefreshStatusHud(CharStats* preferStats)
+{
+    if (preferStats)
+        MaybeLogStatus(preferStats);
 }
 
 static float RegenPowerFromStats(CharStats* stats)
@@ -1027,8 +1009,6 @@ static float calculateToughnessDamageResistanceMult_hook(CharStats* self)
     self->_toughness = saved;
     if (g_cfg.enableMedicalHooks)
         ApplyFoodRegenFromStats(self, 0.02f);
-    else if (g_cfg.showStatusHud)
-        RefreshStatusHud(self);
     return r;
 }
 
@@ -1044,8 +1024,6 @@ static float calculateToughnessWoundDegenerationRate_hook(CharStats* self)
     self->_toughness = saved;
     if (g_cfg.enableMedicalHooks)
         ApplyFoodRegenFromStats(self, 0.05f);
-    else if (g_cfg.showStatusHud)
-        RefreshStatusHud(self);
     return r;
 }
 
@@ -1102,6 +1080,34 @@ static void xpStat_timeBased_hook(CharStats* self, StatsEnumerated st)
 // GetProcAddress(KenshiLib, mangledName) returns a pointer INSIDE KenshiLib.dll,
 // which GetRealAddress can map to the real game function.
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Tooltip hooks — hover toughness / hunger in character UI
+// ---------------------------------------------------------------------------
+
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+static bool (*getStatPenaltiesForGUI_orig)(CharStats*, const std::string&, StatsEnumerated, lektor<StringPair>&) = nullptr;
+static bool getStatPenaltiesForGUI_hook(CharStats* self, const std::string& statName, StatsEnumerated stat, lektor<StringPair>& dats)
+{
+    bool r = false;
+    if (getStatPenaltiesForGUI_orig)
+        r = getStatPenaltiesForGUI_orig(self, statName, stat, dats);
+    // Do not read statName (CRT ABI). Use enum only.
+    if (g_cfg.enableTooltips && self && stat == STAT_TOUGHNESS)
+        AppendToughnessTooltips(&dats, self);
+    return r;
+}
+
+static void (*printExertionHungerMultTooltip_orig)(CharStats*, lektor<StringPair>*) = nullptr;
+static void printExertionHungerMultTooltip_hook(CharStats* self, lektor<StringPair>* dats)
+{
+    if (printExertionHungerMultTooltip_orig)
+        printExertionHungerMultTooltip_orig(self, dats);
+    if (g_cfg.enableTooltips && self && dats)
+        AppendHungerTooltips(dats, self);
+}
+#endif
 
 static void* KenshiLibModule()
 {
@@ -1209,8 +1215,27 @@ static void InstallHooks()
     else
         DebugLog("ToughnessFeast: food regen OFF (EnableMedicalHooks=0)");
 
-    if (g_cfg.showStatusHud)
-        DebugLog("ToughnessFeast: status menu deferred (HudDelayTicks)");
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    if (g_cfg.enableTooltips)
+    {
+        // getStatPenaltiesForGUI — toughness (and other stats) hover
+        HookExport(
+            "?getStatPenaltiesForGUI@CharStats@@QEAA_NAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@W4StatsEnumerated@@AEAV?$lektor@VStringPair@@@@@Z",
+            (void*)getStatPenaltiesForGUI_hook,
+            (void**)&getStatPenaltiesForGUI_orig,
+            "ToughnessFeast: hooked toughness tooltips");
+        HookExport(
+            "?printExertionHungerMultTooltip@CharStats@@QEAAXPEAV?$lektor@VStringPair@@@@@Z",
+            (void*)printExertionHungerMultTooltip_hook,
+            (void**)&printExertionHungerMultTooltip_orig,
+            "ToughnessFeast: hooked hunger tooltips");
+        ResolveStringPairCtor();
+        if (g_spCtor)
+            DebugLog("ToughnessFeast: StringPair ctor resolved");
+        else
+            ErrorLog("ToughnessFeast: StringPair ctor MISSING — tooltips may be empty");
+    }
+#endif
     if (g_cfg.debugLog)
         DebugLog("ToughnessFeast: race unlocks Hiver/Shek/Human via name+flags");
 }
@@ -1236,5 +1261,5 @@ TF_EXPORT void startPlugin()
     }
 
     InstallHooks();
-    DebugLog("ToughnessFeast: ready (race detect + deferred menu)");
+    DebugLog("ToughnessFeast: ready (tooltips, no GUI window)");
 }
