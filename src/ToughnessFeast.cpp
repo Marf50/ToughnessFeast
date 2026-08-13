@@ -290,7 +290,7 @@ static void LoadConfig()
     if (g_cfg.limbMinHunger < 0.f) g_cfg.limbMinHunger = 0.f;
     if (g_cfg.limbMinHunger > g_cfg.hungerBarMax) g_cfg.limbMinHunger = g_cfg.hungerBarMax;
     if (g_cfg.tooltipMaxLines < 10) g_cfg.tooltipMaxLines = 10;
-    if (g_cfg.tooltipMaxLines > 28) g_cfg.tooltipMaxLines = 28;
+    if (g_cfg.tooltipMaxLines > 32) g_cfg.tooltipMaxLines = 32;
 
     Log("ToughnessFeast: config loaded");
 }
@@ -645,12 +645,68 @@ static float PartMaxHp(MedicalSystem::HealthPartStatus* part)
     float maxHp = 100.f;
     TF_SEH_TRY
     {
-        maxHp = part->maxHealth();
-        if (maxHp < 1.f) maxHp = part->_maxHealth;
-        if (maxHp < 1.f || maxHp > 10000.f) maxHp = 100.f;
+        // Prefer the stored field — maxHealth() is a game call and can lie.
+        std::memcpy(&maxHp, (const char*)(void*)part + 0x54, sizeof(maxHp));
+        if (maxHp < 1.f || maxHp > 10000.f || maxHp != maxHp)
+            maxHp = part->_maxHealth;
+        if (maxHp < 1.f || maxHp > 10000.f || maxHp != maxHp)
+            maxHp = 100.f;
     }
     TF_SEH_EXCEPT { maxHp = 100.f; }
     return maxHp;
+}
+
+// HUD-matching 0..1. Kenshi's bar uses derivedFleshHealthPercent (0x60).
+// flesh/_maxHealth alone is why every limb printed 100% while the HUD was hurt.
+static float PartHud01(MedicalSystem::HealthPartStatus* part)
+{
+    if (!part) return -1.f;
+    float der = -999.f, flesh = 0.f, mx = 0.f;
+    TF_SEH_TRY
+    {
+        const char* b = (const char*)(void*)part;
+        std::memcpy(&flesh, b + 0x40, 4);
+        std::memcpy(&mx,    b + 0x54, 4);
+        std::memcpy(&der,   b + 0x60, 4);
+    }
+    TF_SEH_EXCEPT { return -1.f; }
+
+    float fromFlesh = -1.f;
+    if (mx == mx && mx > 1.f && mx < 10000.f && flesh == flesh)
+        fromFlesh = flesh / mx;
+
+    float fromDer = -1.f;
+    if (der == der && der > -1.f && der < 150.f)
+        fromDer = (der > 1.5f) ? der * 0.01f : der;
+
+    float p = -1.f;
+    if (fromDer >= 0.f && fromFlesh >= 0.f)
+        p = (fromDer < fromFlesh) ? fromDer : fromFlesh;
+    else if (fromDer >= 0.f)
+        p = fromDer;
+    else
+        p = fromFlesh;
+
+    if (p != p || p < 0.f) return 0.f;
+    if (p > 1.05f) p = 1.05f;
+    return p;
+}
+
+static float PartStun01(MedicalSystem::HealthPartStatus* part)
+{
+    if (!part) return 0.f;
+    float stun = 0.f, mx = 0.f;
+    TF_SEH_TRY
+    {
+        const char* b = (const char*)(void*)part;
+        std::memcpy(&stun, b + 0x44, 4);
+        std::memcpy(&mx,   b + 0x54, 4);
+    }
+    TF_SEH_EXCEPT { return 0.f; }
+    if (stun != stun || stun <= 0.f) return 0.f;
+    if (mx > 1.f && mx < 10000.f) return stun / mx;
+    if (stun > 1.5f) return stun * 0.01f;
+    return stun;
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,6 +1466,8 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
             float maxHp = 100.f;
             float raw = 0.f;
             int robotic = 0;
+            float hud = -1.f;
+            float stun = 0.f;
 
             if (part)
             {
@@ -1419,20 +1477,22 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
                     maxHp = PartMaxHp(part);
                     raw = part->flesh;
                     if (raw != raw) raw = 0.f;
+                    hud = PartHud01(part);
+                    stun = PartStun01(part);
                 }
                 TF_SEH_EXCEPT
                 {
                     part = nullptr;
                     raw = 0.f;
                     maxHp = 100.f;
+                    hud = -1.f;
                 }
             }
 
             if (robotic || st == LIMB_REPLACED)
             {
-                std::snprintf(L.stage, sizeof(L.stage), "Prosthetic");
-                std::snprintf(L.detail, sizeof(L.detail), "Feast ignores");
-                std::snprintf(L.bar, sizeof(L.bar), "[--------]");
+                std::snprintf(L.stage, sizeof(L.stage), "prosthetic");
+                std::snprintf(L.detail, sizeof(L.detail), "Feast ignores metal");
                 ++n;
                 continue;
             }
@@ -1448,34 +1508,29 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
             if (own > 1.f) own = 1.f;
             L.prog = own;
 
-            float showP = own;
-            if (st == LIMB_ORIGINAL && maxHp > 1.f)
-                showP = (raw > 0.f ? raw / maxHp : 0.f);
-            FormatBar(L.bar, (int)sizeof(L.bar), showP);
-
             char eta[24] = {};
             char why[28] = {};
             if (!canGrow)
-                std::snprintf(why, sizeof(why), "eat >%.0f", g_cfg.limbMinHunger);
+                std::snprintf(why, sizeof(why), "eat >%.0f first", g_cfg.limbMinHunger);
             else if (power <= 0.f)
                 std::snprintf(why, sizeof(why), "need tgh %.0f", UnlockFor(stats));
             else if (rate < 1e-5f)
                 std::snprintf(why, sizeof(why), "too hungry");
             else
-                std::snprintf(why, sizeof(why), "growing");
+                why[0] = 0;
 
             if (st == LIMB_CRUSHED)
             {
                 float formNeed = LimbStumpFormTarget(maxHp);
                 FormatEta(eta, (int)sizeof(eta), 1.f - own, rate, formNeed);
-                std::snprintf(L.stage, sizeof(L.stage), "Missing");
+                std::snprintf(L.stage, sizeof(L.stage), "GONE");
                 std::snprintf(L.next, sizeof(L.next), "stump (-%.0f%% food)", g_cfg.stumpHungerCost * 100.f);
                 if (own >= 0.999f)
-                    std::snprintf(L.detail, sizeof(L.detail), "READY for stump");
-                else if (rate < 1e-5f)
-                    std::snprintf(L.detail, sizeof(L.detail), "%s %.0f%%  %s", L.bar, own * 100.f, why);
+                    std::snprintf(L.detail, sizeof(L.detail), "READY → stump");
+                else if (why[0])
+                    std::snprintf(L.detail, sizeof(L.detail), "bud %.0f%%  %s", own * 100.f, why);
                 else
-                    std::snprintf(L.detail, sizeof(L.detail), "%s %.0f%%  %s", L.bar, own * 100.f, eta);
+                    std::snprintf(L.detail, sizeof(L.detail), "bud %.0f%%  %s", own * 100.f, eta);
                 L.active = 1;
                 L.missing = 1;
                 L.severity = 1.0f;
@@ -1484,62 +1539,111 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
             {
                 float target = LimbBudTarget(maxHp);
                 FormatEta(eta, (int)sizeof(eta), 1.f - own, rate, target);
-                std::snprintf(L.stage, sizeof(L.stage), "Stump");
+                std::snprintf(L.stage, sizeof(L.stage), "STUMP");
                 std::snprintf(L.next, sizeof(L.next), "limb (-%.0f%% food)", g_cfg.restoreHungerCost * 100.f);
                 if (own >= 0.999f)
-                    std::snprintf(L.detail, sizeof(L.detail), "READY to restore");
-                else if (rate < 1e-5f)
-                    std::snprintf(L.detail, sizeof(L.detail), "%s %.0f%%  %s", L.bar, own * 100.f, why);
+                    std::snprintf(L.detail, sizeof(L.detail), "READY → limb");
+                else if (why[0])
+                    std::snprintf(L.detail, sizeof(L.detail), "grow %.0f%%  %s", own * 100.f, why);
                 else
-                    std::snprintf(L.detail, sizeof(L.detail), "%s %.0f%%  %s", L.bar, own * 100.f, eta);
+                    std::snprintf(L.detail, sizeof(L.detail), "grow %.0f%%  %s", own * 100.f, eta);
                 L.active = 1;
                 L.missing = 1;
                 L.severity = 0.92f;
             }
             else
             {
-                float pct = (maxHp > 1.f && raw > 0.f) ? (raw / maxHp) : 0.f;
-                if (pct > 1.2f) pct = 1.2f;
+                float pct = (hud >= 0.f) ? hud : 0.f;
+                if (pct > 1.05f) pct = 1.05f;
+                L.prog = pct;
+
                 if (!part)
                 {
-                    std::snprintf(L.stage, sizeof(L.stage), "OK");
+                    std::snprintf(L.stage, sizeof(L.stage), "?");
                     std::snprintf(L.detail, sizeof(L.detail), "no part data");
                 }
-                else if (pct < g_cfg.limbRestoredStart + 0.06f)
+                else if (pct < 0.995f || stun > 0.04f)
                 {
-                    float needHp = maxHp * g_cfg.limbStrongPct - raw;
+                    float needHp = maxHp * (1.f - pct);
                     if (needHp < 1.f) needHp = 1.f;
-                    FormatEta(eta, (int)sizeof(eta), 1.f, rate * 0.65f, needHp);
-                    std::snprintf(L.stage, sizeof(L.stage), "Fragile");
-                    if (rate < 1e-5f)
-                        std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%  %s", pct * 100.f, why);
+                    FormatEta(eta, (int)sizeof(eta), 1.f, rate > 1e-5f ? rate : 0.f, needHp);
+                    std::snprintf(L.stage, sizeof(L.stage), "%.0f%%", pct * 100.f);
+                    if (stun > 0.04f)
+                        std::snprintf(L.detail, sizeof(L.detail), "hurt  stun %.0f%%  %s",
+                            stun * 100.f, why[0] ? why : eta);
+                    else if (why[0])
+                        std::snprintf(L.detail, sizeof(L.detail), "healing  %s", why);
                     else
-                        std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%  %s", pct * 100.f, eta);
-                    std::snprintf(L.next, sizeof(L.next), "stronger limb");
+                        std::snprintf(L.detail, sizeof(L.detail), "healing  %s", eta);
+                    std::snprintf(L.next, sizeof(L.next), "full flesh");
                     L.active = 1;
-                    L.severity = 0.75f;
-                }
-                else if (pct < g_cfg.limbStrongPct)
-                {
-                    float needHp = maxHp * g_cfg.limbStrongPct - raw;
-                    if (needHp < 1.f) needHp = 1.f;
-                    FormatEta(eta, (int)sizeof(eta), 1.f, rate * 0.65f, needHp);
-                    std::snprintf(L.stage, sizeof(L.stage), "Healing");
-                    if (rate < 1e-5f)
-                        std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%  %s", pct * 100.f, why);
-                    else
-                        std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%  %s", pct * 100.f, eta);
-                    std::snprintf(L.next, sizeof(L.next), "full strength");
-                    L.active = 1;
-                    L.severity = 0.35f + (1.f - pct / g_cfg.limbStrongPct) * 0.35f;
+                    L.severity = 1.f - pct;
                 }
                 else
                 {
                     std::snprintf(L.stage, sizeof(L.stage), "OK");
-                    std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%", pct * 100.f);
+                    std::snprintf(L.detail, sizeof(L.detail), "%.0f%%", pct * 100.f);
                 }
             }
             ++n;
+        }
+
+        // Chest / stomach / head so hurt torso isn't invisible
+        int extras = 0;
+        int torsoSeen = 0;
+        int partCount = 0;
+        TF_SEH_TRY { partCount = med->getPartCount(); }
+        TF_SEH_EXCEPT { partCount = 0; }
+        if (partCount < 0 || partCount > 20) partCount = 0;
+        for (int pi = 0; pi < partCount && n < maxOut; ++pi)
+        {
+            MedicalSystem::HealthPartStatus* p = nullptr;
+            TF_SEH_TRY { p = med->getPart((unsigned long long)pi); }
+            TF_SEH_EXCEPT { p = nullptr; }
+            if (!p || (uintptr_t)p < 0x10000ull) continue;
+
+            int what = 0;
+            TF_SEH_TRY { std::memcpy(&what, (const char*)(void*)p + 0x8, 4); }
+            TF_SEH_EXCEPT { continue; }
+
+            const char* nm = nullptr;
+            if (what == (int)MedicalSystem::HealthPartStatus::PART_HEAD)
+                nm = "Head";
+            else if (what == (int)MedicalSystem::HealthPartStatus::PART_TORSO)
+            {
+                ++torsoSeen;
+                nm = (torsoSeen == 1) ? "Chest" : "Stomach";
+            }
+            else
+                continue;
+
+            float hud = PartHud01(p);
+            float stun = PartStun01(p);
+            if (hud < 0.f) hud = 0.f;
+            if (hud > 1.05f) hud = 1.05f;
+
+            LimbInfo& L = out[n];
+            std::memset(&L, 0, sizeof(L));
+            std::snprintf(L.name, sizeof(L.name), "%s", nm);
+            L.slot = 8 + extras;
+            L.prog = hud;
+            if (hud < 0.995f || stun > 0.04f)
+            {
+                std::snprintf(L.stage, sizeof(L.stage), "%.0f%%", hud * 100.f);
+                if (stun > 0.04f)
+                    std::snprintf(L.detail, sizeof(L.detail), "hurt  stun %.0f%%", stun * 100.f);
+                else
+                    std::snprintf(L.detail, sizeof(L.detail), "healing");
+                L.active = 1;
+                L.severity = 1.f - hud;
+            }
+            else
+            {
+                std::snprintf(L.stage, sizeof(L.stage), "OK");
+                std::snprintf(L.detail, sizeof(L.detail), "%.0f%%", hud * 100.f);
+            }
+            ++n;
+            ++extras;
         }
     }
     TF_SEH_EXCEPT { return n; }
@@ -2514,6 +2618,7 @@ static void StripOldFeastBlock(lektor<StringPair>* dats)
         else std::memcpy(&data, sp, sizeof(data));
         if (!data) continue;
         if (std::strncmp(data, "== Feast", 8) == 0
+         || std::strncmp(data, "Feast", 5) == 0
          || std::strncmp(data, "== Toughness", 12) == 0
          || std::strncmp(data, "-- Limbs", 8) == 0
          || std::strncmp(data, "FEAST", 5) == 0)
@@ -2582,16 +2687,16 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
 #endif
     }
 
-    LimbInfo limbs[4];
-    int nLimbs = CollectLimbs(stats, limbs, 4);
+    LimbInfo limbs[8];
+    int nLimbs = CollectLimbs(stats, limbs, 8);
 
     {
         char r[48];
-        std::snprintf(r, sizeof(r), "%s  tgh %d", RaceName(rk), tInt);
-        line("== Feast ==", r);
+        std::snprintf(r, sizeof(r), "%s  toughness %d", RaceName(rk), tInt);
+        line("Feast", r);
     }
     {
-        char r[48];
+        char r[56];
         std::snprintf(r, sizeof(r), "%.0f / %.0f", HungerAsPoints(hungerRaw), HungerFullBar());
         line("Food", r);
     }
@@ -2599,37 +2704,32 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
     if (rk == RACE_ROBOT)
     {
         line("Status", "Skeletons cannot feast");
-        line("== end ==", "hover Hunger");
         return;
     }
 
     if (power <= 0.f)
     {
         char r[48];
-        std::snprintf(r, sizeof(r), "LOCKED  need tgh %.0f", unlock);
+        std::snprintf(r, sizeof(r), "LOCKED  need toughness %.0f", unlock);
         line("Status", r);
     }
     else if (!limbsOk)
     {
         char r[56];
-        std::snprintf(r, sizeof(r), "heal ON  limbs OFF (eat >%.0f)", g_cfg.limbMinHunger);
+        std::snprintf(r, sizeof(r), "wounds heal  limbs need food >%.0f", g_cfg.limbMinHunger);
         line("Status", r);
     }
     else
     {
-        char r[48];
-        std::snprintf(r, sizeof(r), "ON  heal %.0f%%  pwr %.2f", feedShow * 100.f, power * feedShow);
+        char r[56];
+        std::snprintf(r, sizeof(r), "ON  heal speed %.0f%% of full", feedShow * 100.f);
         line("Status", r);
     }
 
     int active = 0, missing = 0;
     if (nLimbs <= 0)
     {
-        line("Limbs", "scan failed");
-        line("Left Arm", "?");
-        line("Right Arm", "?");
-        line("Left Leg", "?");
-        line("Right Leg", "?");
+        line("Limbs", "could not read body");
     }
     else
     {
@@ -2638,31 +2738,24 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
             if (limbs[i].active) ++active;
             if (limbs[i].missing) ++missing;
             char right[96];
-            std::snprintf(right, sizeof(right), "%s  %s", limbs[i].stage, limbs[i].detail);
+            if (limbs[i].detail[0])
+                std::snprintf(right, sizeof(right), "%s  %s", limbs[i].stage, limbs[i].detail);
+            else
+                std::snprintf(right, sizeof(right), "%s", limbs[i].stage);
             line(limbs[i].name, right);
-            if (limbs[i].active && limbs[i].next[0] && room())
-            {
-                char nx[48];
-                std::snprintf(nx, sizeof(nx), "next: %s", limbs[i].next);
-                line("  next", nx);
-            }
         }
     }
 
     if (missing > 0)
     {
         char r[56];
-        std::snprintf(r, sizeof(r), "stump -%.0f%% food + %.0fs KO",
+        std::snprintf(r, sizeof(r), "-%.0f%% food + %.0fs KO",
             g_cfg.stumpHungerCost * 100.f, g_cfg.stumpKoSeconds);
-        line("Stump cost", r);
-        std::snprintf(r, sizeof(r), "limb -%.0f%% food + %.0fs KO",
+        line("Stump costs", r);
+        std::snprintf(r, sizeof(r), "-%.0f%% food + %.0fs KO",
             g_cfg.restoreHungerCost * 100.f, g_cfg.restoreKoSeconds);
-        line("Restore cost", r);
+        line("Restore costs", r);
     }
-    else if (active > 0)
-        line("Note", "weak limbs heal while fed");
-
-    line("== end ==", "also hover Toughness");
 
     static int tipLog = 0;
     if (g_cfg.debugLog && ((++tipLog) % 80) == 1)
@@ -2746,8 +2839,8 @@ static void PaintFeastPanel(CharStats* stats, void* panel, int cat, int detailed
     if (!g_setLineKey) return;
     if (cat < 0) cat = PanelCategory(panel);
 
-    LimbInfo limbs[4];
-    int n = CollectLimbs(stats, limbs, 4);
+    LimbInfo limbs[8];
+    int n = CollectLimbs(stats, limbs, 8);
     MedicalSystem* med = MedFromStats(stats);
     float h = MedHunger(med);
     float pwr = FeastPower(stats);
@@ -2843,8 +2936,8 @@ static bool hook_statTip(CharStats* self, const void* statName, int stat, lektor
         else
             std::snprintf(right, sizeof(right), "ON  tgh %.0f  food %.0f", GetToughness(self), h);
         TipAppend(dats, "Feast", right);
-        LimbInfo limbs[4];
-        int n = CollectLimbs(self, limbs, 4);
+        LimbInfo limbs[8];
+        int n = CollectLimbs(self, limbs, 8);
         for (int i = 0; i < n; ++i)
         {
             if (!limbs[i].active && !limbs[i].missing) continue;
