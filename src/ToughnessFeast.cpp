@@ -2861,12 +2861,9 @@ static bool hook_statTip(CharStats* self, const void* statName, int stat, lektor
     return r;
 }
 
-static void (*orig_medLoad)(MedicalSystem*, void*) = nullptr;
-static void hook_medLoad(MedicalSystem* self, void* data)
-{
-    if (orig_medLoad) orig_medLoad(self, data);
-    NoteSaveLoaded();
-}
+// MedicalSystem::load is NOT hooked. v1.0.1 crash dump RIP was
+// kenshi_x64+0x64F3CD (13 bytes into load). Grace comes from the first
+// player medicalUpdate instead.
 #endif
 
 // ---------------------------------------------------------------------------
@@ -2974,16 +2971,7 @@ static void InstallHooks()
             LogErr("ToughnessFeast: toughness tip hook failed");
     }
 
-    // MedicalSystem::load — explicit RVA (overloads make GetRealAddress unsafe)
-    {
-        void* real = nullptr;
-        HMODULE exe = GetModuleHandleA(nullptr);
-        if (exe) real = (void*)((unsigned char*)exe + 0x64F3C0);
-        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_medLoad, (void**)&orig_medLoad))
-            Log("ToughnessFeast: MedicalSystem::load grace (debounced)");
-        else
-            LogErr("ToughnessFeast: MedicalSystem::load hook failed");
-    }
+    Log("ToughnessFeast: MedicalSystem::load not hooked (v1.0.1 crash site)");
 #endif
 
     if (g_cfg.enableMedical)

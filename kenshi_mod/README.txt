@@ -12,6 +12,7 @@ WHAT IT DOES
   • Weak / missing limbs slightly hurt combat until mended
   • Save/load will NOT instantly finish a stump — Feast tracks its own
     growth and writes ToughnessFeast.progress next to the DLL
+    (12s lock after the first in-world tick — we do not hook save-load)
 
 WHERE TO SEE HEAL TIME
   • Hover the HUNGER bar — full journal: food (X / 300), status,
