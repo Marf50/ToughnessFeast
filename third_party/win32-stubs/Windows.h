@@ -74,3 +74,4 @@ inline BOOL GetModuleHandleExA(DWORD, LPCSTR, HMODULE* out)
 }
 
 inline HMODULE GetModuleHandleA(LPCSTR) { return nullptr; }
+inline DWORD GetTickCount() { return 0; }

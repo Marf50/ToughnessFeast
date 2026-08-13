@@ -29,8 +29,16 @@ template<typename T> inline intptr_t GetRealAddress(T) { return 0; }
 inline HookStatus AddHook(void*, void*, void**) { return SUCCESS; }
 }
 
-enum StatsEnumerated { STAT_TOUGHNESS = 0 };
-enum LimbState { LIMB_ORIGINAL = 0, LIMB_STUMP = 1, LIMB_REPLACED = 2, LIMB_CRUSHED = 3 };
+enum StatsEnumerated {
+    STAT_NONE=0, STAT_STRENGTH=1, STAT_MELEE_ATTACK=2, STAT_LABOURING=3,
+    STAT_SCIENCE=4, STAT_ENGINEERING=5, STAT_ROBOTICS=6, STAT_SMITHING_WEAPON=7,
+    STAT_SMITHING_ARMOUR=8, STAT_MEDIC=9, STAT_THIEVING=10, STAT_TURRETS=11,
+    STAT_FARMING=12, STAT_COOKING=13, STAT_HIVEMEDIC=14, STAT_VET=15,
+    STAT_STEALTH=16, STAT_ATHLETICS=17, STAT_DEXTERITY=18, STAT_MELEE_DEFENCE=19,
+    STAT_WEAPONS=20, STAT_TOUGHNESS=21
+};
+enum LeftRight { SIDE_NEITHER=0, SIDE_LEFT=1, SIDE_RIGHT=2, SIDE_BOTH=3 };
+enum LimbState { LIMB_ORIGINAL=0, LIMB_STUMP=1, LIMB_REPLACED=2, LIMB_CRUSHED=3 };
 
 class Character; class CharStats; class MedicalSystem; class RaceData; class Item; class GameData;
 class GameData { public: char pad[0x80]; };
@@ -48,6 +56,8 @@ public:
   CharStats* stats=nullptr;
   RaceData* myRace=nullptr;
   CharStats* getStats(){return stats;}
+  bool isPlayerCharacter()const{return true;}
+  bool isWithThePlayer(){return true;}
 };
 class RobotLimbs {
 public:
@@ -66,11 +76,17 @@ public:
   float calculateToughnessWoundDegenerationRate(){return 1;}
   void xpStat_eventBased(StatsEnumerated,float){}
   void xpStat_timeBased(StatsEnumerated){}
+  void getGUIDataForMainInfo(void*, int, bool){}
+  bool getStatPenaltiesForGUI(const std::string&, StatsEnumerated, void*){return false;}
+  float toughness() const { return _toughness; }
+  float getStat(StatsEnumerated, bool) const { return _toughness; }
+  float& getStatRef(StatsEnumerated) { return _toughness; }
 };
 class MedicalSystem {
 public:
   class HealthPartStatus {
   public:
+    enum PartType { PART_TORSO, PART_LEG, PART_ARM, PART_HEAD };
     float flesh=100, fleshStun=0, _maxHealth=100;
     bool isRobotic(){return false;}
     float maxHealth()const{return _maxHealth;}
@@ -78,63 +94,40 @@ public:
     void updateDerivedHealths(){}
   };
   float hunger=1.f;
+  float knockoutTimer=0.f;
+  bool unconcious=false;
   bool dead=false;
+  void startKnockoutTimer(){}
+  void knockout(float){}
+  void knockoutForceTimer(float){}
   CharStats* stats=nullptr;
   Character* me=nullptr;
   RobotLimbs* robotLimbs=nullptr;
+  HealthPartStatus* leftLeg=nullptr;
+  HealthPartStatus* rightLeg=nullptr;
+  HealthPartStatus* leftArm=nullptr;
+  HealthPartStatus* rightArm=nullptr;
   int getPartCount()const{return 0;}
   HealthPartStatus* getPart(unsigned long long){return nullptr;}
   HealthPartStatus* getPart(RobotLimbs::Limb){return nullptr;}
+  HealthPartStatus* getPart(HealthPartStatus::PartType, LeftRight){return nullptr;}
+  LimbState getLimbState(RobotLimbs::Limb)const{return LIMB_ORIGINAL;}
+  void setRobotLimbItem(RobotLimbs::Limb, Item*, bool){}
+  void updateStats(){}
+  void validateHealthValues(){}
+  void medicalUpdate(float){}
+  void periodicUpdate(){}
+  void getMedicalGUIData(void*){}
+  void load(GameData*){}
+  float getToughnessXpBonus(){return 0;}
+  bool isLeftArmOk()const{return true;}
+  bool isRightArmOk()const{return true;}
+  bool canIkick()const{return true;}
 };
 
-namespace MyGUI {
-struct Colour { Colour(float=1,float=1,float=1,float=1){} };
-struct Align { enum Enum { Default=0, Left=1, Top=2, Stretch=4, Center=8 }; };
-struct UString { UString(){} UString(const char*){} UString(const std::string&){} };
-class Widget {
-public:
-  virtual ~Widget(){}
-  template<class T> T* createWidgetReal(const char*, float,float,float,float, int, const char*, const char* =nullptr){return nullptr;}
-  void setVisible(bool){}
-  void setEnabled(bool){}
-  struct Ev { template<class F> void operator+=(F){} };
-};
-class TextBox : public Widget {
-public:
-  void setCaption(const UString&){}
-  void setTextColour(Colour){}
-};
-class EditBox : public TextBox {
-public:
-  void setEditReadOnly(bool){}
-  void setEditMultiLine(bool){}
-  void setEditWordWrap(bool){}
-  void setEditStatic(bool){}
-  void setOnlyText(const UString&){}
-  void setCaption(const UString&){}
-};
-class Button : public Widget {
-public:
-  void setCaption(const UString&){}
-  Ev eventMouseButtonClick;
-};
-class Window : public Widget {
-public:
-  void setCaption(const UString&){}
-  Widget* getClientWidget(){return this;}
-  Ev eventWindowButtonPressed;
-};
-class Gui {
-public:
-  static Gui* getInstancePtr(){return nullptr;}
-  template<class T> T* createWidgetReal(const char*, float,float,float,float, int, const char*, const char* =nullptr){return nullptr;}
-};
-template<class F> inline F newDelegate(F f){return f;}
-}
-
-class StringPair { public: StringPair(){} StringPair(const std::string&, const std::string&){} };
 template<typename T> class lektor {
 public:
-  unsigned count=0, maxSize=0;
   T* stuff=nullptr;
+  unsigned count=0, maxSize=0;
 };
+struct StringPair { char pad[0x60]; };

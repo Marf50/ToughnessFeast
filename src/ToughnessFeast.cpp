@@ -17,7 +17,9 @@
 //                 Stump → (bud) → setLimb(ORIGINAL) + big food dump + longer KO
 //                 Weak ORIGINAL → strengthen. part* always re-fetched after setLimb.
 //
-// UI: Hunger tooltip is the Feast journal (stable hook). No MyGUI windows.
+// UI: Hunger + Toughness tooltips, plus medical / character-info panel
+//      lines via the game's own setLine (MSVC2010 GameStr — never our
+//      std::string). No MyGUI windows (those crashed / would not close).
 // Safety: no medical writes on hit/DR path; SEH around race/tooltip/regrow;
 //         toughness via getStat (never layout-fragile _toughness field).
 // Export: ?startPlugin@@YAXXZ
@@ -115,6 +117,8 @@ struct Config
     float weakLimbDodgeMult;
 
     int   tooltipMaxLines;
+    int   enablePanelUi;          // medical tab + character info lines
+    int   enableToughTip;         // extra lines on Toughness hover
 };
 
 static Config g_cfg = {
@@ -127,7 +131,8 @@ static Config g_cfg = {
     0.28f, 0.55f, 8.0f, 18.0f,    // stumpHunger, restoreHunger, stumpKO, restoreKO
     0.20f,                        // past100 xp
     0.88f, 0.90f, 0.92f, 0.90f,   // weak limb combat mults
-    16                            // tooltip lines
+    20,                           // tooltip lines
+    1, 1                          // panel UI, toughness tip
 };
 
 static char g_pluginDir[MAX_PATH] = {};
@@ -261,6 +266,10 @@ static void LoadConfig()
         else if (!std::strcmp(key, "WeakLimbSpeedMult")) g_cfg.weakLimbSpeedMult = fval();
         else if (!std::strcmp(key, "WeakLimbDodgeMult")) g_cfg.weakLimbDodgeMult = fval();
         else if (!std::strcmp(key, "TooltipMaxLines")) g_cfg.tooltipMaxLines = (int)fval();
+        else if (!std::strcmp(key, "EnablePanelUi") || !std::strcmp(key, "EnablePanelUI"))
+            g_cfg.enablePanelUi = bval();
+        else if (!std::strcmp(key, "EnableToughnessTooltip") || !std::strcmp(key, "EnableToughTip"))
+            g_cfg.enableToughTip = bval();
     }
     std::fclose(f);
 
@@ -280,8 +289,8 @@ static void LoadConfig()
     if (g_cfg.hungerBarMax > 10000.f) g_cfg.hungerBarMax = 10000.f;
     if (g_cfg.limbMinHunger < 0.f) g_cfg.limbMinHunger = 0.f;
     if (g_cfg.limbMinHunger > g_cfg.hungerBarMax) g_cfg.limbMinHunger = g_cfg.hungerBarMax;
-    if (g_cfg.tooltipMaxLines < 8) g_cfg.tooltipMaxLines = 8;
-    if (g_cfg.tooltipMaxLines > 24) g_cfg.tooltipMaxLines = 24;
+    if (g_cfg.tooltipMaxLines < 10) g_cfg.tooltipMaxLines = 10;
+    if (g_cfg.tooltipMaxLines > 28) g_cfg.tooltipMaxLines = 28;
 
     Log("ToughnessFeast: config loaded");
 }
@@ -652,11 +661,246 @@ struct LimbInfo
 {
     char name[16];
     char stage[24];
-    char detail[40];
-    int  active;     // needs feast attention
-    int  missing;    // stump/crush
-    float severity;  // 0..1 combat impact
+    char detail[64];
+    char bar[16];
+    char next[36];
+    int  slot;
+    int  active;
+    int  missing;
+    float severity;
+    float prog;
 };
+
+enum { TF_ST_NONE = 0, TF_ST_CRUSH = 1, TF_ST_STUMP = 2, TF_ST_OK = 3 };
+
+struct LimbProg
+{
+    int   stage;
+    float p;
+    int   ticks;
+    int   dirty;
+};
+
+struct CharProg
+{
+    char     name[48];
+    LimbProg limb[4];
+};
+
+static CharProg g_chars[24];
+static int      g_nChars = 0;
+static int      g_progDirty = 0;
+static unsigned g_lastSaveMs = 0;
+static unsigned g_justLoadedMs = 0;
+static int      g_panelUiDead = 0;
+
+static int JustLoaded()
+{
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    if (!g_justLoadedMs) return 0;
+    return (GetTickCount() - g_justLoadedMs) < 12000u ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+static void NoteSaveLoaded()
+{
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    g_justLoadedMs = GetTickCount();
+    Log("ToughnessFeast: save loaded — limb stages will not complete for 12s");
+#endif
+}
+
+static int MsvcStrCopy(const char* strObj, char* out, int outsz)
+{
+    if (!strObj || !out || outsz < 2) return 0;
+    out[0] = 0;
+    size_t sz = 0, cap = 0;
+    std::memcpy(&sz,  strObj + 16, sizeof(sz));
+    std::memcpy(&cap, strObj + 24, sizeof(cap));
+    if (sz > 200 || cap > 1ull << 20) return 0;
+    const char* src = nullptr;
+    if (cap > 15)
+        std::memcpy(&src, strObj, sizeof(src));
+    else
+        src = strObj;
+    if (!src || (uintptr_t)src < 0x10000ull) return 0;
+    int n = (int)sz;
+    if (n >= outsz) n = outsz - 1;
+    if (n < 0) n = 0;
+    std::memcpy(out, src, (size_t)n);
+    out[n] = 0;
+    return n;
+}
+
+static int CharDisplayName(Character* me, char* out, int outsz)
+{
+    if (!me || !out) return 0;
+    out[0] = 0;
+    TF_SEH_TRY { return MsvcStrCopy((const char*)(void*)me + 0x18, out, outsz); }
+    TF_SEH_EXCEPT { return 0; }
+}
+
+static CharProg* FindCharProg(const char* name, int create)
+{
+    if (!name || !name[0]) name = "?";
+    for (int i = 0; i < g_nChars; ++i)
+        if (std::strcmp(g_chars[i].name, name) == 0)
+            return &g_chars[i];
+    if (!create || g_nChars >= 24) return nullptr;
+    CharProg* c = &g_chars[g_nChars++];
+    std::memset(c, 0, sizeof(*c));
+    std::snprintf(c->name, sizeof(c->name), "%s", name);
+    return c;
+}
+
+static LimbProg* BindLimbProg(Character* me, int slot, int gameStage, int doTick)
+{
+    if (slot < 0 || slot > 3) return nullptr;
+    char nm[48] = {};
+    CharDisplayName(me, nm, sizeof(nm));
+    CharProg* c = FindCharProg(nm[0] ? nm : "?", 1);
+    if (!c) return nullptr;
+    LimbProg* lp = &c->limb[slot];
+
+    int want = TF_ST_OK;
+    if (gameStage == (int)LIMB_CRUSHED) want = TF_ST_CRUSH;
+    else if (gameStage == (int)LIMB_STUMP) want = TF_ST_STUMP;
+    else if (gameStage == (int)LIMB_REPLACED) want = TF_ST_OK;
+
+    if (lp->stage != want)
+    {
+        lp->stage = want;
+        if (want == TF_ST_CRUSH || want == TF_ST_STUMP)
+            lp->p = 0.f;
+        else
+            lp->p = 1.f;
+        lp->ticks = 0;
+        lp->dirty = 1;
+        g_progDirty = 1;
+    }
+    if (doTick && lp->ticks < 100000) ++lp->ticks;
+    return lp;
+}
+
+static void ProgressFilePath(char* out, int n)
+{
+    out[0] = 0;
+    if (g_pluginDir[0])
+        std::snprintf(out, (size_t)n, "%s\\ToughnessFeast.progress", g_pluginDir);
+    else
+        std::snprintf(out, (size_t)n, "ToughnessFeast.progress");
+}
+
+static void LoadLimbProgress()
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    return;
+#else
+    char path[MAX_PATH];
+    ProgressFilePath(path, MAX_PATH);
+    FILE* f = nullptr;
+    fopen_s(&f, path, "r");
+    if (!f) return;
+    char line[160];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return; }
+    if (std::strncmp(line, "TFPROG", 6) != 0) { fclose(f); return; }
+    g_nChars = 0;
+    CharProg* cur = nullptr;
+    while (fgets(line, sizeof(line), f))
+    {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        if (line[0] == '@')
+        {
+            char nm[48] = {};
+            std::sscanf(line + 1, " %47[^\r\n]", nm);
+            cur = FindCharProg(nm, 1);
+            continue;
+        }
+        int slot = -1, st = 0;
+        float pr = 0.f;
+        if (std::sscanf(line, "%d %d %f", &slot, &st, &pr) == 3 && cur && slot >= 0 && slot < 4)
+        {
+            if (pr < 0.f) pr = 0.f;
+            if (pr > 0.98f) pr = 0.98f;
+            cur->limb[slot].stage = st;
+            cur->limb[slot].p = pr;
+            cur->limb[slot].ticks = 0;
+        }
+    }
+    fclose(f);
+    Log("ToughnessFeast: limb progress loaded");
+#endif
+}
+
+static void SaveLimbProgress(int force)
+{
+#if defined(TOUGHNESSFEAST_LINUX_IDE)
+    (void)force;
+    return;
+#else
+    if (!g_progDirty && !force) return;
+    unsigned now = GetTickCount();
+    if (!force && g_lastSaveMs && (now - g_lastSaveMs) < 8000u) return;
+    char path[MAX_PATH];
+    ProgressFilePath(path, MAX_PATH);
+    FILE* f = nullptr;
+    fopen_s(&f, path, "w");
+    if (!f) return;
+    std::fprintf(f, "TFPROG 1\n");
+    for (int i = 0; i < g_nChars; ++i)
+    {
+        std::fprintf(f, "@%s\n", g_chars[i].name);
+        for (int sl = 0; sl < 4; ++sl)
+        {
+            LimbProg* lp = &g_chars[i].limb[sl];
+            if (lp->stage == TF_ST_NONE) continue;
+            std::fprintf(f, "%d %d %.4f\n", sl, lp->stage, lp->p);
+        }
+    }
+    fclose(f);
+    g_progDirty = 0;
+    g_lastSaveMs = now;
+#endif
+}
+
+static void FormatEta(char* out, int n, float remain01, float hpPerSec, float stageHp)
+{
+    if (!out || n < 8) return;
+    if (remain01 <= 0.002f) { std::snprintf(out, (size_t)n, "READY"); return; }
+    if (hpPerSec < 1e-5f)
+    {
+        std::snprintf(out, (size_t)n, "paused");
+        return;
+    }
+    float remainHp = remain01 * (stageHp > 1.f ? stageHp : 40.f);
+    float sec = remainHp / hpPerSec;
+    if (sec < 45.f) { std::snprintf(out, (size_t)n, "<1 min"); return; }
+    int mins = (int)(sec / 60.f + 0.5f);
+    if (mins < 60) { std::snprintf(out, (size_t)n, "~%d min", mins); return; }
+    int hrs = mins / 60;
+    mins = mins % 60;
+    if (hrs >= 48) { std::snprintf(out, (size_t)n, "~%d days", hrs / 24); return; }
+    if (mins == 0) { std::snprintf(out, (size_t)n, "~%d hr", hrs); return; }
+    std::snprintf(out, (size_t)n, "~%dh %dm", hrs, mins);
+}
+
+static void FormatBar(char* out, int n, float p)
+{
+    if (!out || n < 12) return;
+    if (p < 0.f) p = 0.f;
+    if (p > 1.f) p = 1.f;
+    int fill = (int)(p * 8.f + 0.5f);
+    if (fill > 8) fill = 8;
+    char marks[9];
+    for (int i = 0; i < 8; ++i) marks[i] = (i < fill) ? '#' : '-';
+    marks[8] = 0;
+    std::snprintf(out, (size_t)n, "[%s]", marks);
+}
+
+static float CurrentLimbRate(CharStats* stats, MedicalSystem* med);
+static int CanRegrowLimbsAtHunger(float h);
 
 // ---- Limb mutation (setLimb must hit real game code) ----
 static MedicalSystem::HealthPartStatus* ResolveLimb(MedicalSystem* med, int slot);
@@ -1126,18 +1370,25 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
     if (!stats || !out || maxOut <= 0) return 0;
     MedicalSystem* med = MedFromStats(stats);
     if (!med) return 0;
+    Character* me = CharFromStats(stats);
+    if (!me)
+        std::memcpy(&me, (const char*)(void*)med + 0xE0, sizeof(me));
 
     static const char* kNames[4] = { "Left Arm", "Right Arm", "Left Leg", "Right Leg" };
     int n = 0;
+    float rate = CurrentLimbRate(stats, med);
+    float hunger = MedHunger(med);
+    int canGrow = CanRegrowLimbsAtHunger(hunger);
+    float power = FeastPower(stats);
 
     TF_SEH_TRY
     {
-        // Always emit all 4 slots — missing limbs often have NULL part*
         for (int i = 0; i < 4 && n < maxOut; ++i)
         {
             LimbInfo& L = out[n];
             std::memset(&L, 0, sizeof(L));
             std::snprintf(L.name, sizeof(L.name), "%s", kNames[i]);
+            L.slot = i;
 
             LimbState st = ReadLimbState(med, i);
             MedicalSystem::HealthPartStatus* part = ResolveLimb(med, i);
@@ -1151,9 +1402,7 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
                 TF_SEH_TRY
                 {
                     if (part->isRobotic()) robotic = 1;
-                    maxHp = part->maxHealth();
-                    if (maxHp < 1.f) maxHp = part->_maxHealth;
-                    if (maxHp < 1.f) maxHp = 100.f;
+                    maxHp = PartMaxHp(part);
                     raw = part->flesh;
                     if (raw != raw) raw = 0.f;
                 }
@@ -1169,39 +1418,50 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
             {
                 std::snprintf(L.stage, sizeof(L.stage), "Prosthetic");
                 std::snprintf(L.detail, sizeof(L.detail), "Feast ignores");
+                std::snprintf(L.bar, sizeof(L.bar), "[--------]");
                 ++n;
                 continue;
             }
 
-            float pos = raw > 0.f ? raw : 0.f;
-            float pct = pos / maxHp;
-            if (pct > 1.2f) pct = 1.2f;
-
-            // No part pointer + crushed/stump OR negative flesh on HUD = missing
             if (st == LIMB_CRUSHED || (!part && st != LIMB_ORIGINAL && st != LIMB_REPLACED))
             {
-                // Treat unknown-null as missing when HUD would show a bar at -HP
                 if (st != LIMB_STUMP) st = LIMB_CRUSHED;
             }
-            // If part null and state still ORIGINAL, still list as "OK?" — better than blank
-            // But user missing limbs: getLimbState should return STUMP/CRUSHED
+
+            LimbProg* lp = BindLimbProg(me, i, (int)st, 0);
+            float own = (lp && (st == LIMB_CRUSHED || st == LIMB_STUMP)) ? lp->p : 0.f;
+            if (own < 0.f) own = 0.f;
+            if (own > 1.f) own = 1.f;
+            L.prog = own;
+
+            float showP = own;
+            if (st == LIMB_ORIGINAL && maxHp > 1.f)
+                showP = (raw > 0.f ? raw / maxHp : 0.f);
+            FormatBar(L.bar, (int)sizeof(L.bar), showP);
+
+            char eta[24] = {};
+            char why[28] = {};
+            if (!canGrow)
+                std::snprintf(why, sizeof(why), "eat >%.0f", g_cfg.limbMinHunger);
+            else if (power <= 0.f)
+                std::snprintf(why, sizeof(why), "need tgh %.0f", UnlockFor(stats));
+            else if (rate < 1e-5f)
+                std::snprintf(why, sizeof(why), "too hungry");
+            else
+                std::snprintf(why, sizeof(why), "growing");
 
             if (st == LIMB_CRUSHED)
             {
                 float formNeed = LimbStumpFormTarget(maxHp);
-                float prog = formNeed > 0.01f ? (pos / formNeed) : 0.f;
-                if (prog > 1.f) prog = 1.f;
-                if (!part)
-                {
-                    std::snprintf(L.stage, sizeof(L.stage), "Missing");
-                    std::snprintf(L.detail, sizeof(L.detail), "ready for stump");
-                }
+                FormatEta(eta, (int)sizeof(eta), 1.f - own, rate, formNeed);
+                std::snprintf(L.stage, sizeof(L.stage), "Missing");
+                std::snprintf(L.next, sizeof(L.next), "stump (-%.0f%% food)", g_cfg.stumpHungerCost * 100.f);
+                if (own >= 0.999f)
+                    std::snprintf(L.detail, sizeof(L.detail), "READY for stump");
+                else if (rate < 1e-5f)
+                    std::snprintf(L.detail, sizeof(L.detail), "%s %.0f%%  %s", L.bar, own * 100.f, why);
                 else
-                {
-                    std::snprintf(L.stage, sizeof(L.stage), "Missing");
-                    std::snprintf(L.detail, sizeof(L.detail),
-                        "to stump %.0f%%", prog * 100.f);
-                }
+                    std::snprintf(L.detail, sizeof(L.detail), "%s %.0f%%  %s", L.bar, own * 100.f, eta);
                 L.active = 1;
                 L.missing = 1;
                 L.severity = 1.0f;
@@ -1209,43 +1469,53 @@ static int CollectLimbs(CharStats* stats, LimbInfo* out, int maxOut)
             else if (st == LIMB_STUMP)
             {
                 float target = LimbBudTarget(maxHp);
-                float prog = target > 0.01f ? (pos / target) : 0.f;
-                if (prog > 1.f) prog = 1.f;
-                if (prog >= 0.98f)
-                {
-                    std::snprintf(L.stage, sizeof(L.stage), "Stump");
-                    std::snprintf(L.detail, sizeof(L.detail), "READY — restoring");
-                }
+                FormatEta(eta, (int)sizeof(eta), 1.f - own, rate, target);
+                std::snprintf(L.stage, sizeof(L.stage), "Stump");
+                std::snprintf(L.next, sizeof(L.next), "limb (-%.0f%% food)", g_cfg.restoreHungerCost * 100.f);
+                if (own >= 0.999f)
+                    std::snprintf(L.detail, sizeof(L.detail), "READY to restore");
+                else if (rate < 1e-5f)
+                    std::snprintf(L.detail, sizeof(L.detail), "%s %.0f%%  %s", L.bar, own * 100.f, why);
                 else
-                {
-                    std::snprintf(L.stage, sizeof(L.stage), "Stump");
-                    std::snprintf(L.detail, sizeof(L.detail),
-                        "bud %.0f%%", prog * 100.f);
-                }
+                    std::snprintf(L.detail, sizeof(L.detail), "%s %.0f%%  %s", L.bar, own * 100.f, eta);
                 L.active = 1;
                 L.missing = 1;
                 L.severity = 0.92f;
             }
             else
             {
-                // ORIGINAL (or unknown with part)
+                float pct = (maxHp > 1.f && raw > 0.f) ? (raw / maxHp) : 0.f;
+                if (pct > 1.2f) pct = 1.2f;
                 if (!part)
                 {
-                    // State says original but no part — still show something
                     std::snprintf(L.stage, sizeof(L.stage), "OK");
                     std::snprintf(L.detail, sizeof(L.detail), "no part data");
                 }
                 else if (pct < g_cfg.limbRestoredStart + 0.06f)
                 {
+                    float needHp = maxHp * g_cfg.limbStrongPct - raw;
+                    if (needHp < 1.f) needHp = 1.f;
+                    FormatEta(eta, (int)sizeof(eta), 1.f, rate * 0.65f, needHp);
                     std::snprintf(L.stage, sizeof(L.stage), "Fragile");
-                    std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%", pct * 100.f);
+                    if (rate < 1e-5f)
+                        std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%  %s", pct * 100.f, why);
+                    else
+                        std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%  %s", pct * 100.f, eta);
+                    std::snprintf(L.next, sizeof(L.next), "stronger limb");
                     L.active = 1;
                     L.severity = 0.75f;
                 }
                 else if (pct < g_cfg.limbStrongPct)
                 {
+                    float needHp = maxHp * g_cfg.limbStrongPct - raw;
+                    if (needHp < 1.f) needHp = 1.f;
+                    FormatEta(eta, (int)sizeof(eta), 1.f, rate * 0.65f, needHp);
                     std::snprintf(L.stage, sizeof(L.stage), "Healing");
-                    std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%", pct * 100.f);
+                    if (rate < 1e-5f)
+                        std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%  %s", pct * 100.f, why);
+                    else
+                        std::snprintf(L.detail, sizeof(L.detail), "HP %.0f%%  %s", pct * 100.f, eta);
+                    std::snprintf(L.next, sizeof(L.next), "full strength");
                     L.active = 1;
                     L.severity = 0.35f + (1.f - pct / g_cfg.limbStrongPct) * 0.35f;
                 }
@@ -1531,6 +1801,16 @@ static int CanRegrowLimbsAtHunger(float h)
     return (h > need) ? 1 : 0;
 }
 
+static float CurrentLimbRate(CharStats* stats, MedicalSystem* med)
+{
+    if (!stats) return 0.f;
+    float h = MedHunger(med);
+    if (!CanRegrowLimbsAtHunger(h)) return 0.f;
+    float pwr = FeastPower(stats) * HungerFill01(h);
+    if (pwr < 0.f) pwr = 0.f;
+    return g_cfg.limbRegrowPerSec * pwr;
+}
+
 static void SpendHungerAndKnockout(MedicalSystem* med, float hungerFrac, float koSeconds, const char* reason)
 {
     if (!med) return;
@@ -1585,6 +1865,9 @@ static void ProcessLimbs(
     }
     ResolveLimbApi();
 
+    Character* meProg = nullptr;
+    std::memcpy(&meProg, (const char*)(void*)med + 0xE0, sizeof(meProg));
+
     // Growth budget (0 if feast locked — still allow completing already-full buds)
     float budget = 0.f;
     if (power > 0.f && dt > 0.f)
@@ -1626,6 +1909,8 @@ static void ProcessLimbs(
             else if (eff != LIMB_CRUSHED && eff != LIMB_STUMP)
                 continue;
 
+            LimbProg* lp = BindLimbProg(meProg, i, (int)eff, 1);
+
             // ========== CRUSHED ==========
             if (eff == LIMB_CRUSHED)
             {
@@ -1634,6 +1919,14 @@ static void ProcessLimbs(
 
                 if (!part)
                 {
+                    if (lp && budget > 0.f)
+                    {
+                        lp->p += (budget * 0.50f) / 12.f;
+                        if (lp->p > 1.f) lp->p = 1.f;
+                        lp->dirty = 1; g_progDirty = 1;
+                    }
+                    int readyNp = (lp && lp->p >= 0.999f && lp->ticks >= 20 && !JustLoaded()) ? 1 : 0;
+                    if (!readyNp) continue;
                     static unsigned s_np[4] = {0,0,0,0};
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
                     unsigned now = GetTickCount();
@@ -1642,6 +1935,8 @@ static void ProcessLimbs(
 #endif
                     if (ForceFormStump(med, i))
                     {
+                        if (lp) { lp->stage = TF_ST_STUMP; lp->p = 0.f; lp->ticks = 0; lp->dirty = 1; }
+                        g_progDirty = 1;
                         anyHeal = 1;
                         SpendHungerAndKnockout(med, g_cfg.stumpHungerCost, g_cfg.stumpKoSeconds,
                             "formed STUMP (no part)");
@@ -1681,22 +1976,20 @@ static void ProcessLimbs(
                     }
                 }
 
-                // Ready for stump: mostly cleared overdamage (don't need full 0+)
-                int ready = 0;
-                float almostOk = maxHp * 0.08f;
-                if (flesh >= -almostOk && flesh >= formNeed * 0.85f) ready = 1;
-                if (flesh >= 0.f) ready = 1; // any non-negative = stump ok
-                if (flesh >= -1.f && maxHp <= 30.f) ready = 1;
-                // Re-loss: if we've been healing and flesh improved past -half max, stump
-                if (flesh > -maxHp * 0.35f && flesh > -50.f && budget <= 0.01f)
-                    ready = 1; // forceComplete path with tiny power
+                if (lp && budget > 0.f)
+                {
+                    float needHp = formNeed > 1.f ? formNeed : 12.f;
+                    lp->p += (budget * 0.50f) / needHp;
+                    if (lp->p > 1.f) lp->p = 1.f;
+                    lp->dirty = 1; g_progDirty = 1;
+                }
+                int ready = (lp && lp->p >= 0.999f && lp->ticks >= 20 && !JustLoaded()) ? 1 : 0;
                 if (ready)
                 {
                     static unsigned s_scd[4] = {0,0,0,0};
                     static int s_scd_was[4] = {-1,-1,-1,-1};
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
                     unsigned now = GetTickCount();
-                    // Reset cooldown when re-entering crushed after a restore cycle
                     if (s_scd_was[i] != (int)LIMB_CRUSHED) s_scd[i] = 0;
                     s_scd_was[i] = (int)LIMB_CRUSHED;
                     if (s_scd[i] && (now - s_scd[i]) < 3000u) continue;
@@ -1704,6 +1997,8 @@ static void ProcessLimbs(
 #endif
                     if (ForceFormStump(med, i))
                     {
+                        if (lp) { lp->stage = TF_ST_STUMP; lp->p = 0.f; lp->ticks = 0; lp->dirty = 1; }
+                        g_progDirty = 1;
                         anyHeal = 1;
                         SpendHungerAndKnockout(med, g_cfg.stumpHungerCost, g_cfg.stumpKoSeconds,
                             "formed STUMP");
@@ -1719,6 +2014,16 @@ static void ProcessLimbs(
 
                 if (!part)
                 {
+                    if (lp && budget > 0.f)
+                    {
+                        float needHp = maxHp * g_cfg.limbBudThreshold;
+                        if (needHp < 1.f) needHp = 40.f;
+                        lp->p += budget / needHp;
+                        if (lp->p > 1.f) lp->p = 1.f;
+                        lp->dirty = 1; g_progDirty = 1;
+                    }
+                    int readyNp = (lp && lp->p >= 0.999f && lp->ticks >= 20 && !JustLoaded()) ? 1 : 0;
+                    if (!readyNp) continue;
                     static unsigned s_rs[4] = {0,0,0,0};
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
                     unsigned now = GetTickCount();
@@ -1727,6 +2032,8 @@ static void ProcessLimbs(
 #endif
                     if (ForceRestoreOrganicLimb(med, i))
                     {
+                        if (lp) { lp->stage = TF_ST_OK; lp->p = 1.f; lp->ticks = 0; lp->dirty = 1; }
+                        g_progDirty = 1;
                         anyHeal = 1;
                         SpendHungerAndKnockout(med, g_cfg.restoreHungerCost, g_cfg.restoreKoSeconds,
                             "RESTORED limb (null stump part)");
@@ -1768,15 +2075,15 @@ static void ProcessLimbs(
                     }
                 }
 
-                // READY to restore: same math as tooltip 100%
-                // tip prog = (pos/maxHp)/budThreshold → 1.0 when flesh >= target
-                float prog = (maxHp > 0.f && g_cfg.limbBudThreshold > 0.01f)
-                    ? ( (flesh > 0.f ? flesh : 0.f) / maxHp ) / g_cfg.limbBudThreshold
-                    : 0.f;
-                int ready = 0;
-                if (flesh >= target * 0.95f) ready = 1;
-                if (prog >= 0.98f) ready = 1;
-                if (flesh >= maxHp * 0.90f && flesh > 1.f) ready = 1; // full stump HP
+                if (lp && budget > 0.f)
+                {
+                    float needHp = target > 1.f ? target : (maxHp * 0.40f);
+                    if (needHp < 1.f) needHp = 1.f;
+                    lp->p += budget / needHp;
+                    if (lp->p > 1.f) lp->p = 1.f;
+                    lp->dirty = 1; g_progDirty = 1;
+                }
+                int ready = (lp && lp->p >= 0.999f && lp->ticks >= 20 && !JustLoaded()) ? 1 : 0;
 
                 if (ready)
                 {
@@ -1792,13 +2099,12 @@ static void ProcessLimbs(
                     int restored = ForceRestoreOrganicLimb(med, i);
                     if (restored)
                     {
+                        if (lp) { lp->stage = TF_ST_OK; lp->p = 1.f; lp->ticks = 0; lp->dirty = 1; }
+                        g_progDirty = 1;
                         anyHeal = 1;
                         if (worstSev < 0.85f) worstSev = 0.85f;
-                        char why[96];
-                        std::snprintf(why, sizeof(why),
-                            "RESTORED limb slot %d (prog=%.0f%%)",
-                            i, prog * 100.f);
-                        SpendHungerAndKnockout(med, g_cfg.restoreHungerCost, g_cfg.restoreKoSeconds, why);
+                        SpendHungerAndKnockout(med, g_cfg.restoreHungerCost, g_cfg.restoreKoSeconds,
+                            "RESTORED limb");
                     }
                     else if (g_cfg.debugLog)
                     {
@@ -1838,15 +2144,29 @@ static void ProcessLimbs(
                             anyHeal = 1;
                         }
                     }
-                    // If nearly clear, form stump immediately
                     float f2 = part->flesh;
-                    if (f2 == f2 && f2 >= -maxHp * 0.1f)
+                    if (f2 == f2 && f2 >= -maxHp * 0.1f && !JustLoaded())
                     {
-                        if (ForceFormStump(med, i))
+                        LimbProg* lpRelost = BindLimbProg(meProg, i, (int)LIMB_CRUSHED, 1);
+                        if (lpRelost && budget > 0.f)
                         {
-                            anyHeal = 1;
-                            SpendHungerAndKnockout(med, g_cfg.stumpHungerCost, g_cfg.stumpKoSeconds,
-                                "formed STUMP (re-lost)");
+                            lpRelost->p += (budget * 0.50f) / 12.f;
+                            if (lpRelost->p > 1.f) lpRelost->p = 1.f;
+                            lpRelost->dirty = 1; g_progDirty = 1;
+                        }
+                        if (lpRelost && lpRelost->p >= 0.999f && lpRelost->ticks >= 20)
+                        {
+                            if (ForceFormStump(med, i))
+                            {
+                                lpRelost->stage = TF_ST_STUMP;
+                                lpRelost->p = 0.f;
+                                lpRelost->ticks = 0;
+                                lpRelost->dirty = 1;
+                                g_progDirty = 1;
+                                anyHeal = 1;
+                                SpendHungerAndKnockout(med, g_cfg.stumpHungerCost, g_cfg.stumpKoSeconds,
+                                    "formed STUMP (re-lost)");
+                            }
                         }
                     }
                     continue;
@@ -1925,35 +2245,20 @@ static void ApplyFeastTick(CharStats* stats, float dt)
     int allowGrow = (needsFood && power > 0.f && feed > 0.001f) ? 1 : 0;
     float growPower = (allowGrow && limbsOk) ? (power * feed) : 0.f;
 
-    // Limb stage work only above 200 food
+    // Limb stage work only above 200 food — complete from OWNED progress
     int forceComplete = 0;
-    if (g_cfg.enableLimbRestore && limbsOk)
+    if (g_cfg.enableLimbRestore && limbsOk && me && !JustLoaded())
     {
         for (int i = 0; i < 4; ++i)
         {
             LimbState st = ReadLimbState(med, i);
             if (st != LIMB_STUMP && st != LIMB_CRUSHED) continue;
-            MedicalSystem::HealthPartStatus* part = ResolveLimb(med, i);
-            if (st == LIMB_CRUSHED && !part) { forceComplete = 1; break; }
-            if (!part) continue;
-            float maxHp = PartMaxHp(part);
-            float flesh = part->flesh;
-            if (flesh != flesh) flesh = 0.f;
-            if (st == LIMB_STUMP)
+            LimbProg* lp = BindLimbProg(me, i, (int)st, 0);
+            if (lp && lp->p >= 0.999f && lp->ticks >= 20)
             {
-                float target = LimbBudTarget(maxHp);
-                float prog = (maxHp > 0.f && g_cfg.limbBudThreshold > 0.01f)
-                    ? ((flesh > 0.f ? flesh : 0.f) / maxHp) / g_cfg.limbBudThreshold : 0.f;
-                if (flesh >= target * 0.95f || prog >= 0.98f || flesh >= maxHp * 0.90f)
-                    forceComplete = 1;
+                forceComplete = 1;
+                break;
             }
-            else if (st == LIMB_CRUSHED)
-            {
-                float formNeed = LimbStumpFormTarget(maxHp);
-                if (flesh >= formNeed * 0.95f || flesh >= maxHp * 0.95f)
-                    forceComplete = 1;
-            }
-            if (forceComplete) break;
         }
     }
 
@@ -2075,6 +2380,7 @@ static void ApplyFeastTick(CharStats* stats, float dt)
         LogErr("ToughnessFeast: ApplyFeastTick SEH — clearing regen guard");
     }
     g_inRegen = 0;
+    SaveLimbProgress(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2094,7 +2400,7 @@ static void GameStrSet(GameStr* s, const char* text)
     std::memset(s, 0, sizeof(*s));
     if (!text) text = "";
     size_t n = std::strlen(text);
-    if (n > 95) n = 95;
+    if (n > 120) n = 120;
     if (n < 16)
     {
         std::memcpy(s->u.sso, text, n);
@@ -2104,14 +2410,14 @@ static void GameStrSet(GameStr* s, const char* text)
     else
     {
         // ring buffer for longer lines (heap-layout MSVC2010 string)
-        static char pool[24][96];
+        static char pool[40][128];
         static int pi = 0;
-        char* slot = pool[pi++ % 24];
+        char* slot = pool[pi++ % 40];
         std::memcpy(slot, text, n);
         slot[n] = 0;
         s->u.ptr = slot;
         s->size = n;
-        s->cap = 95;
+        s->cap = 127;
     }
 }
 
@@ -2178,7 +2484,8 @@ static void StripOldFeastBlock(lektor<StringPair>* dats)
         if (!data) continue;
         if (std::strncmp(data, "== Feast", 8) == 0
          || std::strncmp(data, "== Toughness", 12) == 0
-         || std::strncmp(data, "-- Limbs", 8) == 0)
+         || std::strncmp(data, "-- Limbs", 8) == 0
+         || std::strncmp(data, "FEAST", 5) == 0)
         {
             dats->count = i;
             return;
@@ -2194,16 +2501,15 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
 
     StripOldFeastBlock(dats);
 
-    // Carve room for full journal — limbs first so they always fit
     unsigned need = (unsigned)g_cfg.tooltipMaxLines;
-    if (need < 14) need = 14;
+    if (need < 16) need = 16;
     if (need + 1 > dats->maxSize)
         need = dats->maxSize > 3 ? dats->maxSize - 1 : 0;
     if (need > 0 && dats->count + need > dats->maxSize)
         dats->count = dats->maxSize - need;
 
     unsigned start = dats->count;
-    unsigned budget = need > 0 ? need : 14;
+    unsigned budget = need > 0 ? need : 16;
 
     auto room = [&]() -> int {
         return (dats->count < dats->maxSize && dats->count - start < budget) ? 1 : 0;
@@ -2219,37 +2525,12 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
     float unlock = UnlockFor(stats);
     RaceKind rk = DetectRace(stats);
 
-    MedicalSystem* med = stats->medical;
-    float hungerPct = -1.f;
-    float hungerRaw = -1.f;
-    if (med && !med->dead)
-    {
-        float h = med->hunger;
-        if (h == h && h >= 0.f && h < 1e6f)
-        {
-            hungerRaw = h;
-            float full = HungerFullEstimate(h);
-            if (h <= 5.f) hungerPct = h * 100.f; // 0..1 bar
-            else hungerPct = (full > 0.f ? (h / full) * 100.f : 0.f);
-            if (hungerPct > 100.f) hungerPct = 100.f;
-        }
-    }
+    MedicalSystem* med = MedFromStats(stats);
+    float hungerRaw = MedHunger(med);
+    float fullShow = HungerFullEstimate(hungerRaw);
+    float feedShow = HungerFill01(hungerRaw);
+    int limbsOk = CanRegrowLimbsAtHunger(hungerRaw);
 
-    line("== Feast ==", "live");
-    {
-        char r[40];
-        std::snprintf(r, sizeof(r), "%d (cap %.0f)", tInt, g_cfg.combatCap);
-        line("Toughness", r);
-    }
-    line("Race", RaceName(rk));
-
-    // LIMBS FIRST (priority) — always try even if dead flag weird
-    LimbInfo limbs[4];
-    int nLimbs = 0;
-    if (med)
-        nLimbs = CollectLimbs(stats, limbs, 4);
-
-    // TIP_BACKUP_FEAST: if medical tick ever stalls, hovering Hunger keeps feast alive
     {
         static unsigned s_tipTick = 0;
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
@@ -2257,7 +2538,6 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
         if (s_tipTick == 0 || (now - s_tipTick) >= 1000u)
         {
             s_tipTick = now;
-            // Clear stuck guard before tip-driven tick
             if (g_inRegen)
             {
                 g_inRegen = 0;
@@ -2271,12 +2551,53 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
 #endif
     }
 
+    LimbInfo limbs[4];
+    int nLimbs = CollectLimbs(stats, limbs, 4);
+
+    {
+        char r[48];
+        std::snprintf(r, sizeof(r), "%s  tgh %d", RaceName(rk), tInt);
+        line("== Feast ==", r);
+    }
+    {
+        char r[48];
+        if (hungerRaw > 5.f)
+            std::snprintf(r, sizeof(r), "%.0f / %.0f", hungerRaw, fullShow);
+        else
+            std::snprintf(r, sizeof(r), "%.0f%% of bar", hungerRaw * 100.f);
+        line("Food", r);
+    }
+
+    if (rk == RACE_ROBOT)
+    {
+        line("Status", "Skeletons cannot feast");
+        line("== end ==", "hover Hunger");
+        return;
+    }
+
+    if (power <= 0.f)
+    {
+        char r[48];
+        std::snprintf(r, sizeof(r), "LOCKED  need tgh %.0f", unlock);
+        line("Status", r);
+    }
+    else if (!limbsOk)
+    {
+        char r[56];
+        std::snprintf(r, sizeof(r), "heal ON  limbs OFF (eat >%.0f)", g_cfg.limbMinHunger);
+        line("Status", r);
+    }
+    else
+    {
+        char r[48];
+        std::snprintf(r, sizeof(r), "ON  heal %.0f%%  pwr %.2f", feedShow * 100.f, power * feedShow);
+        line("Status", r);
+    }
+
     int active = 0, missing = 0;
-    line("-- Limbs --", "4 slots");
     if (nLimbs <= 0)
     {
         line("Limbs", "scan failed");
-        // Still print placeholders so user sees the section
         line("Left Arm", "?");
         line("Right Arm", "?");
         line("Left Leg", "?");
@@ -2288,85 +2609,33 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
         {
             if (limbs[i].active) ++active;
             if (limbs[i].missing) ++missing;
-            char right[56];
-            std::snprintf(right, sizeof(right), "%s %s", limbs[i].stage, limbs[i].detail);
+            char right[96];
+            std::snprintf(right, sizeof(right), "%s  %s", limbs[i].stage, limbs[i].detail);
             line(limbs[i].name, right);
+            if (limbs[i].active && limbs[i].next[0] && room())
+            {
+                char nx[48];
+                std::snprintf(nx, sizeof(nx), "next: %s", limbs[i].next);
+                line("  next", nx);
+            }
         }
     }
-    {
-        char r[48];
-        if (missing > 0)
-            std::snprintf(r, sizeof(r), "%d missing", missing);
-        else if (active > 0)
-            std::snprintf(r, sizeof(r), "%d mending", active);
-        else
-            std::snprintf(r, sizeof(r), "all sound");
-        line("Summary", r);
-    }
 
-    if (rk == RACE_ROBOT)
+    if (missing > 0)
     {
-        line("Feast", "Skeletons cannot");
-        line("== end ==", "-");
-        return;
+        char r[56];
+        std::snprintf(r, sizeof(r), "stump -%.0f%% food + %.0fs KO",
+            g_cfg.stumpHungerCost * 100.f, g_cfg.stumpKoSeconds);
+        line("Stump cost", r);
+        std::snprintf(r, sizeof(r), "limb -%.0f%% food + %.0fs KO",
+            g_cfg.restoreHungerCost * 100.f, g_cfg.restoreKoSeconds);
+        line("Restore cost", r);
     }
+    else if (active > 0)
+        line("Note", "weak limbs heal while fed");
 
-    if (power <= 0.f)
-    {
-        char r[40];
-        std::snprintf(r, sizeof(r), "need %.0f tgh", unlock);
-        line("Feast", "LOCKED");
-        line("Unlock", r);
-    }
-    else
-    {
-        char r[48];
-        float drain = g_cfg.hungerDrainPerSec * power * 100.f;
-        float feedTip = 0.f;
-        if (med)
-        {
-            float hh = MedHunger(med);
-            feedTip = HungerFill01(hh);
-        }
-        std::snprintf(r, sizeof(r), "ON pwr %.2f", power * (feedTip > 0.f ? feedTip : 0.f));
-        line("Feast", r);
-        std::snprintf(r, sizeof(r), "%.0f%% of full", feedTip * 100.f);
-        line("Heal scale", r);
-        {
-            float hh = med ? MedHunger(med) : 0.f;
-            int lok = CanRegrowLimbsAtHunger(hh);
-            char lr[48];
-            if (lok)
-                std::snprintf(lr, sizeof(lr), "ON (need >%.0f)", g_cfg.limbMinHunger);
-            else
-                std::snprintf(lr, sizeof(lr), "OFF eat>%.0f", g_cfg.limbMinHunger);
-            line("Limb regrow", lr);
-        }
-        std::snprintf(r, sizeof(r), "stump -%.0f%%  limb -%.0f%%",
-            g_cfg.stumpHungerCost * 100.f, g_cfg.restoreHungerCost * 100.f);
-        line("Stage food", r);
-    }
+    line("== end ==", "also hover Toughness");
 
-    if (hungerPct >= 0.f)
-    {
-        char r[48];
-        int ok = hungerPct >= g_cfg.minHunger * 100.f ? 1 : 0;
-        float fullShow = HungerFullEstimate(hungerRaw > 0.f ? hungerRaw : 0.f);
-        float feedShow = HungerFill01(hungerRaw > 0.f ? hungerRaw : 0.f);
-        if (hungerRaw > 5.f)
-            std::snprintf(r, sizeof(r), "%.0f/%.0f scale %.0f%%",
-                hungerRaw, fullShow, feedShow * 100.f);
-        else
-            std::snprintf(r, sizeof(r), "%.0f%% scale %.0f%%",
-                hungerPct, feedShow * 100.f);
-        line("Hunger", r);
-    }
-
-    if (active > 0 || missing > 0)
-        line("Note", "stage done = food dump + KO");
-    line("== end ==", "hover Hunger");
-
-    // Throttled diagnostics (avoid flooding RE_Kenshi log while hovering)
     static int tipLog = 0;
     if (g_cfg.debugLog && ((++tipLog) % 80) == 1)
     {
@@ -2393,6 +2662,182 @@ static void hook_hungerTip(CharStats* self, lektor<StringPair>* dats)
         static int once = 0;
         if (!once) { LogErr("ToughnessFeast: tooltip SEH"); once = 1; }
     }
+}
+#endif
+
+
+// ---------------------------------------------------------------------------
+// Extra UI surfaces (ABI-safe): game setLine via GameStr, plus Toughness tip
+// ---------------------------------------------------------------------------
+
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+typedef void* (*SetLineKeyFn)(void* panel, const GameStr* key, const GameStr* s1,
+                              const GameStr* s2, int cat, bool last, bool keyVis);
+static SetLineKeyFn g_setLineKey = nullptr;
+
+static void ResolveSetLine()
+{
+    if (g_setLineKey) return;
+    HMODULE exe = GetModuleHandleA(nullptr);
+    if (!exe) exe = GetModuleHandleA("kenshi_GOG_x64.exe");
+    if (!exe) exe = GetModuleHandleA("kenshi_x64.exe");
+    if (!exe) return;
+    // DatapanelGUI::setLine(key, s1, s2, category, last, keyVisible) RVA 0x6FD4B0
+    g_setLineKey = (SetLineKeyFn)((unsigned char*)exe + 0x6FD4B0);
+}
+
+static int PanelCategory(void* panel)
+{
+    if (!panel) return 0;
+    int cat = 0;
+    TF_SEH_TRY { std::memcpy(&cat, (const char*)panel + 0xB0, 4); }
+    TF_SEH_EXCEPT { cat = 0; }
+    if (cat < 0 || cat > 16) cat = 0;
+    return cat;
+}
+
+static int PanelSetLine(void* panel, const char* key, const char* left, const char* right, int cat)
+{
+    if (!panel || !g_setLineKey) return 0;
+    GameStr k, a, b;
+    GameStrSet(&k, key ? key : "");
+    GameStrSet(&a, left ? left : "");
+    GameStrSet(&b, right ? right : "");
+    TF_SEH_TRY
+    {
+        g_setLineKey(panel, &k, &a, &b, cat, false, false);
+        return 1;
+    }
+    TF_SEH_EXCEPT { return 0; }
+}
+
+static void PaintFeastPanel(CharStats* stats, void* panel, int cat, int detailed)
+{
+    if (!stats || !panel || g_panelUiDead) return;
+    ResolveSetLine();
+    if (!g_setLineKey) return;
+    if (cat < 0) cat = PanelCategory(panel);
+
+    LimbInfo limbs[4];
+    int n = CollectLimbs(stats, limbs, 4);
+    MedicalSystem* med = MedFromStats(stats);
+    float h = MedHunger(med);
+    float pwr = FeastPower(stats);
+    int grow = CanRegrowLimbsAtHunger(h);
+
+    char headR[64];
+    if (DetectRace(stats) == RACE_ROBOT)
+        std::snprintf(headR, sizeof(headR), "skeletons cannot feast");
+    else if (pwr <= 0.f)
+        std::snprintf(headR, sizeof(headR), "LOCKED  need tgh %.0f", UnlockFor(stats));
+    else if (!grow)
+        std::snprintf(headR, sizeof(headR), "eat >%.0f to grow limbs", g_cfg.limbMinHunger);
+    else
+        std::snprintf(headR, sizeof(headR), "ON  food %.0f  tgh %.0f", h, GetToughness(stats));
+
+    if (!PanelSetLine(panel, "TF_HEAD", "Feast", headR, cat))
+    {
+        g_panelUiDead = 1;
+        LogErr("ToughnessFeast: setLine failed — panel UI disabled");
+        return;
+    }
+
+    int painted = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (!detailed && !limbs[i].active && !limbs[i].missing) continue;
+        char key[12];
+        std::snprintf(key, sizeof(key), "TF_L%d", i);
+        char right[72];
+        std::snprintf(right, sizeof(right), "%s  %s", limbs[i].stage, limbs[i].detail);
+        PanelSetLine(panel, key, limbs[i].name, right, cat);
+        ++painted;
+    }
+    if (painted == 0 && detailed)
+        PanelSetLine(panel, "TF_OK", "Limbs", "all sound", cat);
+}
+
+static void (*orig_medGui)(MedicalSystem*, void*) = nullptr;
+static void hook_medGui(MedicalSystem* self, void* panel)
+{
+    if (orig_medGui) orig_medGui(self, panel);
+    if (!g_cfg.enablePanelUi || !g_cfg.enableTooltips || g_panelUiDead) return;
+    if (!self || !panel) return;
+    CharStats* st = StatsFromMedical(self);
+    if (!st) return;
+    Character* me = nullptr;
+    std::memcpy(&me, (const char*)(void*)self + 0xE0, sizeof(me));
+    if (!IsPlayerSide(me)) return;
+    TF_SEH_TRY { PaintFeastPanel(st, panel, -1, 1); }
+    TF_SEH_EXCEPT
+    {
+        g_panelUiDead = 1;
+        LogErr("ToughnessFeast: medical panel SEH — panel UI off");
+    }
+}
+
+static void (*orig_mainInfo)(CharStats*, void*, int, bool) = nullptr;
+static void hook_mainInfo(CharStats* self, void* panel, int category, bool combatMode)
+{
+    if (orig_mainInfo) orig_mainInfo(self, panel, category, combatMode);
+    if (!g_cfg.enablePanelUi || !g_cfg.enableTooltips || g_panelUiDead) return;
+    if (!self || !panel) return;
+    TF_SEH_TRY { PaintFeastPanel(self, panel, category, 0); }
+    TF_SEH_EXCEPT
+    {
+        g_panelUiDead = 1;
+        LogErr("ToughnessFeast: main info panel SEH — panel UI off");
+    }
+}
+
+static bool (*orig_statTip)(CharStats*, const void*, int, lektor<StringPair>*) = nullptr;
+static bool hook_statTip(CharStats* self, const void* statName, int stat, lektor<StringPair>* dats)
+{
+    bool r = false;
+    if (orig_statTip) r = orig_statTip(self, statName, stat, dats);
+    if (!g_cfg.enableToughTip || !g_cfg.enableTooltips) return r;
+    if (stat != (int)STAT_TOUGHNESS) return r;
+    if (!self || !dats || !dats->stuff) return r;
+    if (dats->maxSize == 0 || dats->count > dats->maxSize) return r;
+    TF_SEH_TRY
+    {
+        // Compact ETA block on the Toughness hover
+        if (dats->count + 8 > dats->maxSize && dats->maxSize > 8)
+            dats->count = dats->maxSize - 8;
+        MedicalSystem* med = MedFromStats(self);
+        float pwr = FeastPower(self);
+        float h = MedHunger(med);
+        char right[64];
+        if (pwr <= 0.f)
+            std::snprintf(right, sizeof(right), "LOCKED  need %.0f", UnlockFor(self));
+        else if (!CanRegrowLimbsAtHunger(h))
+            std::snprintf(right, sizeof(right), "eat >%.0f to grow limbs", g_cfg.limbMinHunger);
+        else
+            std::snprintf(right, sizeof(right), "ON  tgh %.0f  food %.0f", GetToughness(self), h);
+        TipAppend(dats, "Feast", right);
+        LimbInfo limbs[4];
+        int n = CollectLimbs(self, limbs, 4);
+        for (int i = 0; i < n; ++i)
+        {
+            if (!limbs[i].active && !limbs[i].missing) continue;
+            char rr[72];
+            std::snprintf(rr, sizeof(rr), "%s  %s", limbs[i].stage, limbs[i].detail);
+            TipAppend(dats, limbs[i].name, rr);
+        }
+    }
+    TF_SEH_EXCEPT
+    {
+        static int once = 0;
+        if (!once) { LogErr("ToughnessFeast: toughness tip SEH"); once = 1; }
+    }
+    return r;
+}
+
+static void (*orig_medLoad)(MedicalSystem*, void*) = nullptr;
+static void hook_medLoad(MedicalSystem* self, void* data)
+{
+    if (orig_medLoad) orig_medLoad(self, data);
+    NoteSaveLoaded();
 }
 #endif
 
@@ -2452,6 +2897,80 @@ static void InstallHooks()
         ResolveStringPairCtor();
         if (g_spCtor) Log("ToughnessFeast: StringPair ctor OK");
         else LogErr("ToughnessFeast: StringPair ctor missing");
+
+        {
+            void* real = nullptr;
+            TF_SEH_TRY
+            {
+                intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::getMedicalGUIData);
+                if (a) real = (void*)a;
+            }
+            TF_SEH_EXCEPT { real = nullptr; }
+            if (!real)
+            {
+                HMODULE exe = GetModuleHandleA(nullptr);
+                if (exe) real = (void*)((unsigned char*)exe + 0x889140);
+            }
+            if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_medGui, (void**)&orig_medGui))
+                Log("ToughnessFeast: medical panel Feast lines");
+            else
+                LogErr("ToughnessFeast: getMedicalGUIData hook failed");
+        }
+        {
+            void* real = nullptr;
+            TF_SEH_TRY
+            {
+                intptr_t a = KenshiLib::GetRealAddress(&CharStats::getGUIDataForMainInfo);
+                if (a) real = (void*)a;
+            }
+            TF_SEH_EXCEPT { real = nullptr; }
+            if (!real)
+            {
+                HMODULE exe = GetModuleHandleA(nullptr);
+                if (exe) real = (void*)((unsigned char*)exe + 0x890970);
+            }
+            if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_mainInfo, (void**)&orig_mainInfo))
+                Log("ToughnessFeast: character info Feast lines");
+            else
+                LogErr("ToughnessFeast: getGUIDataForMainInfo hook failed");
+        }
+        {
+            void* real = nullptr;
+            TF_SEH_TRY
+            {
+                intptr_t a = KenshiLib::GetRealAddress(&CharStats::getStatPenaltiesForGUI);
+                if (a) real = (void*)a;
+            }
+            TF_SEH_EXCEPT { real = nullptr; }
+            if (!real)
+            {
+                HMODULE exe = GetModuleHandleA(nullptr);
+                if (exe) real = (void*)((unsigned char*)exe + 0x88F350);
+            }
+            if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_statTip, (void**)&orig_statTip))
+                Log("ToughnessFeast: Toughness hover ETAs");
+            else
+                LogErr("ToughnessFeast: toughness tip hook failed");
+        }
+    }
+
+    {
+        void* real = nullptr;
+        TF_SEH_TRY
+        {
+            intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::load);
+            if (a) real = (void*)a;
+        }
+        TF_SEH_EXCEPT { real = nullptr; }
+        if (!real)
+        {
+            HMODULE exe = GetModuleHandleA(nullptr);
+            if (exe) real = (void*)((unsigned char*)exe + 0x64F3C0);
+        }
+        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_medLoad, (void**)&orig_medLoad))
+            Log("ToughnessFeast: MedicalSystem::load (no instant stump on save)");
+        else
+            LogErr("ToughnessFeast: MedicalSystem::load hook failed");
     }
 #endif
 
@@ -2473,6 +2992,7 @@ TF_EXPORT void startPlugin()
     Log("ToughnessFeast: startPlugin");
     ResolvePluginDir();
     LoadConfig();
+    LoadLimbProgress();
 
     if (!g_cfg.enableHooks)
     {
@@ -2481,5 +3001,5 @@ TF_EXPORT void startPlugin()
     }
 
     InstallHooks();
-    Log("ToughnessFeast: ready — hover Hunger for Feast journal");
+    Log("ToughnessFeast: ready — Hunger / Toughness / medical panel show heal time");
 }
