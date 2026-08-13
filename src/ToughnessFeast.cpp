@@ -3228,14 +3228,11 @@ static int WidgetUnderMouse(MyGUI::Widget* w)
 
 static int MouseLeftDown()
 {
-    MyGUI::InputManager* im = nullptr;
-    TF_SEH_TRY { im = MyGUI::InputManager::getInstancePtr(); }
-    TF_SEH_EXCEPT { im = nullptr; }
-    if (!im) return 0;
-    int down = 0;
-    TF_SEH_TRY { down = im->isButtonPressed(MyGUI::MouseButton::Left) ? 1 : 0; }
-    TF_SEH_EXCEPT { down = 0; }
-    return down;
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 static void TickInvMenu(InventoryGUI* gui)
