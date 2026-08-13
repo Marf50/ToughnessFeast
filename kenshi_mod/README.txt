@@ -14,10 +14,11 @@ WHAT IT DOES
     growth and writes ToughnessFeast.progress next to the DLL
 
 WHERE TO SEE HEAL TIME
-  • Hover the HUNGER bar — full journal: food, status, every limb,
-    progress bar, and time remaining (~2h 14m or "eat >200")
-  • Hover TOUGHNESS on the character sheet — compact Feast + ETAs
-  • Character info / medical panel — Feast lines on the selected person
+  • Hover the HUNGER bar — full journal: food (X / 300), status,
+    every limb, progress bar, and time remaining (~2h 14m or "eat >200")
+
+  Extra panel / Toughness-hover lines are OFF (they crashed the game
+  on load). Hunger tooltip is the supported UI.
 
 INSTALL
   1. Install RE_Kenshi for Kenshi.
@@ -30,6 +31,7 @@ INSTALL
        mods/ToughnessFeast/ToughnessFeast.mod
   3. Enable the mod in the Kenshi launcher / mod list.
   4. Launch. Check RE_Kenshi log for "ToughnessFeast: ready".
+     You should NOT see hundreds of "save loaded" lines.
 
 HOW TO PLAY
   • Train toughness (get hit, fight). Past 100 it still creeps up.
@@ -43,8 +45,8 @@ HOW TO PLAY
 CONFIG
   Edit config.ini next to the DLL. All rates and unlocks are there.
   Set EnableHooks=0 for load-only safe mode.
-  Set EnablePanelUi=0 if the medical / info panel lines ever misbehave.
-  Set EnableToughnessTooltip=0 to keep only the Hunger journal.
+  Set EnablePanelUi=1 / EnableToughnessTooltip=1 only if you want to
+    experiment — those hooks crashed on load in v1.0.0.
   Set EnableTooltips=0 if tips ever misbehave (gameplay stays on).
   Set DebugLog=0 to quiet the log.
 
@@ -54,4 +56,5 @@ SAFE BY DESIGN
   • Race via getRace() virtual (never bad myRace offset)
   • Stage complete only from owned progress (never from loaded flesh)
   • setLimb only at bud→restore; part pointer always re-fetched
-  • SEH around race / tip / regrow / panel
+  • SEH around race / tip / regrow
+  • Panel UI hooks not installed unless you turn them on

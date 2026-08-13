@@ -132,7 +132,7 @@ static Config g_cfg = {
     0.20f,                        // past100 xp
     0.88f, 0.90f, 0.92f, 0.90f,   // weak limb combat mults
     20,                           // tooltip lines
-    1, 1                          // panel UI, toughness tip
+    0, 0                          // panel UI OFF (crashes), toughness tip OFF
 };
 
 static char g_pluginDir[MAX_PATH] = {};
@@ -704,11 +704,21 @@ static int JustLoaded()
 #endif
 }
 
+// Called from MedicalSystem::load (every character) AND first world tick.
+// Must be cheap and log at most once per load burst — hundreds of NPCs load at once.
 static void NoteSaveLoaded()
 {
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
-    g_justLoadedMs = GetTickCount();
-    Log("ToughnessFeast: save loaded — limb stages will not complete for 12s");
+    unsigned now = GetTickCount();
+    if (g_justLoadedMs && (now - g_justLoadedMs) < 4000u)
+        return;
+    g_justLoadedMs = now;
+    static unsigned s_lastLog = 0;
+    if (!s_lastLog || (now - s_lastLog) > 8000u)
+    {
+        Log("ToughnessFeast: load grace 12s — stages will not complete");
+        s_lastLog = now;
+    }
 #endif
 }
 
@@ -901,6 +911,10 @@ static void FormatBar(char* out, int n, float p)
 
 static float CurrentLimbRate(CharStats* stats, MedicalSystem* med);
 static int CanRegrowLimbsAtHunger(float h);
+static float HungerAsPoints(float h);
+static float HungerFullBar();
+static float Hunger01(float h);
+static float HungerFill01(float h);
 
 // ---- Limb mutation (setLimb must hit real game code) ----
 static MedicalSystem::HealthPartStatus* ResolveLimb(MedicalSystem* med, int slot);
@@ -1670,6 +1684,9 @@ static void DriveFeastFromMedical(MedicalSystem* med, float dt)
     std::memcpy(&me, (const char*)(void*)med + 0xE0, sizeof(me));
     if (!IsPlayerSide(me)) return;
 
+    // First player tick after a load/session — lock stages for 12s
+    NoteSaveLoaded();
+
     // Heartbeat so log proves feast is alive (every ~30s)
 #if !defined(TOUGHNESSFEAST_LINUX_IDE)
     static unsigned s_hb = 0;
@@ -1678,8 +1695,9 @@ static void DriveFeastFromMedical(MedicalSystem* med, float dt)
         s_hb = now;
         char msg[120];
         std::snprintf(msg, sizeof(msg),
-            "ToughnessFeast: heartbeat t=%.0f p=%.2f hunger=%.2f",
-            GetToughness(stats), FeastPower(stats), MedHunger(med));
+            "ToughnessFeast: heartbeat t=%.0f p=%.2f hunger=%.0f/%.0f",
+            GetToughness(stats), FeastPower(stats),
+            HungerAsPoints(MedHunger(med)), HungerFullBar());
         Log(msg);
     }
 #endif
@@ -1750,16 +1768,40 @@ static void ApplyWeakLimbPenalty(CharStats* stats, float severity01)
     press(stats->skillMultDodge, g_cfg.weakLimbDodgeMult);
 }
 
-// Hunger bar: game uses ~0..1 OR large nutrition points (player: full ≈ 300).
-static float HungerFullEstimate(float h)
+// Hunger bar: Kenshi stores either 0..1 (internal) or large nutrition points
+// (player HUD ≈ 0..300). A value of 2 is 2/300 (starving), NOT "200% full".
+static float HungerFullBar()
 {
-    if (h != h || h < 0.f) return g_cfg.hungerBarMax > 1.f ? g_cfg.hungerBarMax : 300.f;
-    // Normalized 0..1 (or small buffer above 1)
-    if (h <= 5.f) return 1.f;
-    // Large scale — fixed full bar (default 300), not "current hunger"
     float full = g_cfg.hungerBarMax;
     if (full < 50.f) full = 300.f;
     return full;
+}
+
+static float HungerAsPoints(float h)
+{
+    if (h != h || h < 0.f) return 0.f;
+    float bar = HungerFullBar();
+    // Only treat as a 0..1 fraction when it is clearly a fraction.
+    if (h <= 1.15f) return h * bar;
+    if (h > bar) return bar;
+    return h;
+}
+
+static float Hunger01(float h)
+{
+    float bar = HungerFullBar();
+    float pts = HungerAsPoints(h);
+    if (bar < 0.001f) return 0.f;
+    float f = pts / bar;
+    if (f < 0.f) f = 0.f;
+    if (f > 1.f) f = 1.f;
+    return f;
+}
+
+static float HungerFullEstimate(float h)
+{
+    (void)h;
+    return HungerFullBar();
 }
 
 // 0 at/near starving → 1 when full. Gradual heal/drain multiply by this
@@ -1767,11 +1809,7 @@ static float HungerFullEstimate(float h)
 static float HungerFill01(float h)
 {
     if (h != h || h < 0.f) return 0.f;
-    float full = HungerFullEstimate(h);
-    if (full < 0.001f) return 0.f;
-    float fill = h / full;
-    if (fill > 1.f) fill = 1.f;
-    if (fill < 0.f) fill = 0.f;
+    float fill = Hunger01(h);
     float min = g_cfg.minHunger;
     if (min < 0.f) min = 0.f;
     if (min > 0.85f) min = 0.85f;
@@ -1791,14 +1829,7 @@ static int CanRegrowLimbsAtHunger(float h)
     if (h != h || h < 0.f) return 0;
     float need = g_cfg.limbMinHunger;
     if (need < 0.f) need = 200.f;
-    // 0..1 bar mode: convert points → fraction of bar
-    if (h <= 5.f)
-    {
-        float full = g_cfg.hungerBarMax > 1.f ? g_cfg.hungerBarMax : 300.f;
-        float need01 = need / full;
-        return (h > need01) ? 1 : 0;
-    }
-    return (h > need) ? 1 : 0;
+    return (HungerAsPoints(h) > need) ? 1 : 0;
 }
 
 static float CurrentLimbRate(CharStats* stats, MedicalSystem* med)
@@ -2278,7 +2309,7 @@ static void ApplyFeastTick(CharStats* stats, float dt)
         char msg[180];
         std::snprintf(msg, sizeof(msg),
             "ToughnessFeast: tick p=%.2f feed=%.2f grow=%d force=%d hunger=%.0f/%.0f robots=%p",
-            power, feed, allowGrow, forceComplete, hunger, fullH, (void*)GetRobotLimbs(med));
+            power, feed, allowGrow, forceComplete, HungerAsPoints(hunger), HungerFullBar(), (void*)GetRobotLimbs(med));
         Log(msg);
     }
 
@@ -2561,10 +2592,7 @@ static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
     }
     {
         char r[48];
-        if (hungerRaw > 5.f)
-            std::snprintf(r, sizeof(r), "%.0f / %.0f", hungerRaw, fullShow);
-        else
-            std::snprintf(r, sizeof(r), "%.0f%% of bar", hungerRaw * 100.f);
+        std::snprintf(r, sizeof(r), "%.0f / %.0f", HungerAsPoints(hungerRaw), HungerFullBar());
         line("Food", r);
     }
 
@@ -2897,78 +2925,62 @@ static void InstallHooks()
         ResolveStringPairCtor();
         if (g_spCtor) Log("ToughnessFeast: StringPair ctor OK");
         else LogErr("ToughnessFeast: StringPair ctor missing");
-
-        {
-            void* real = nullptr;
-            TF_SEH_TRY
-            {
-                intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::getMedicalGUIData);
-                if (a) real = (void*)a;
-            }
-            TF_SEH_EXCEPT { real = nullptr; }
-            if (!real)
-            {
-                HMODULE exe = GetModuleHandleA(nullptr);
-                if (exe) real = (void*)((unsigned char*)exe + 0x889140);
-            }
-            if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_medGui, (void**)&orig_medGui))
-                Log("ToughnessFeast: medical panel Feast lines");
-            else
-                LogErr("ToughnessFeast: getMedicalGUIData hook failed");
-        }
-        {
-            void* real = nullptr;
-            TF_SEH_TRY
-            {
-                intptr_t a = KenshiLib::GetRealAddress(&CharStats::getGUIDataForMainInfo);
-                if (a) real = (void*)a;
-            }
-            TF_SEH_EXCEPT { real = nullptr; }
-            if (!real)
-            {
-                HMODULE exe = GetModuleHandleA(nullptr);
-                if (exe) real = (void*)((unsigned char*)exe + 0x890970);
-            }
-            if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_mainInfo, (void**)&orig_mainInfo))
-                Log("ToughnessFeast: character info Feast lines");
-            else
-                LogErr("ToughnessFeast: getGUIDataForMainInfo hook failed");
-        }
-        {
-            void* real = nullptr;
-            TF_SEH_TRY
-            {
-                intptr_t a = KenshiLib::GetRealAddress(&CharStats::getStatPenaltiesForGUI);
-                if (a) real = (void*)a;
-            }
-            TF_SEH_EXCEPT { real = nullptr; }
-            if (!real)
-            {
-                HMODULE exe = GetModuleHandleA(nullptr);
-                if (exe) real = (void*)((unsigned char*)exe + 0x88F350);
-            }
-            if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_statTip, (void**)&orig_statTip))
-                Log("ToughnessFeast: Toughness hover ETAs");
-            else
-                LogErr("ToughnessFeast: toughness tip hook failed");
-        }
     }
 
+    // Panel / toughness-hover hooks are OPTIONAL. They write into Kenshi's
+    // DatapanelGUI via a guessed setLine RVA and crashed on load in 1.0.0.
+    // Hunger tooltip is the supported UI. Leave these off unless testing.
+    if (g_cfg.enablePanelUi)
     {
         void* real = nullptr;
         TF_SEH_TRY
         {
-            intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::load);
+            intptr_t a = KenshiLib::GetRealAddress(&MedicalSystem::getMedicalGUIData);
             if (a) real = (void*)a;
         }
         TF_SEH_EXCEPT { real = nullptr; }
-        if (!real)
+        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_medGui, (void**)&orig_medGui))
+            Log("ToughnessFeast: medical panel Feast lines (experimental)");
+        else
+            LogErr("ToughnessFeast: getMedicalGUIData hook failed");
+
+        real = nullptr;
+        TF_SEH_TRY
         {
-            HMODULE exe = GetModuleHandleA(nullptr);
-            if (exe) real = (void*)((unsigned char*)exe + 0x64F3C0);
+            intptr_t a = KenshiLib::GetRealAddress(&CharStats::getGUIDataForMainInfo);
+            if (a) real = (void*)a;
         }
+        TF_SEH_EXCEPT { real = nullptr; }
+        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_mainInfo, (void**)&orig_mainInfo))
+            Log("ToughnessFeast: character info Feast lines (experimental)");
+        else
+            LogErr("ToughnessFeast: getGUIDataForMainInfo hook failed");
+    }
+    else
+        Log("ToughnessFeast: panel UI off (hunger tooltip only)");
+
+    if (g_cfg.enableToughTip)
+    {
+        void* real = nullptr;
+        TF_SEH_TRY
+        {
+            intptr_t a = KenshiLib::GetRealAddress(&CharStats::getStatPenaltiesForGUI);
+            if (a) real = (void*)a;
+        }
+        TF_SEH_EXCEPT { real = nullptr; }
+        if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_statTip, (void**)&orig_statTip))
+            Log("ToughnessFeast: Toughness hover ETAs (experimental)");
+        else
+            LogErr("ToughnessFeast: toughness tip hook failed");
+    }
+
+    // MedicalSystem::load — explicit RVA (overloads make GetRealAddress unsafe)
+    {
+        void* real = nullptr;
+        HMODULE exe = GetModuleHandleA(nullptr);
+        if (exe) real = (void*)((unsigned char*)exe + 0x64F3C0);
         if (real && KenshiLib::SUCCESS == KenshiLib::AddHook(real, (void*)hook_medLoad, (void**)&orig_medLoad))
-            Log("ToughnessFeast: MedicalSystem::load (no instant stump on save)");
+            Log("ToughnessFeast: MedicalSystem::load grace (debounced)");
         else
             LogErr("ToughnessFeast: MedicalSystem::load hook failed");
     }
@@ -3001,5 +3013,5 @@ TF_EXPORT void startPlugin()
     }
 
     InstallHooks();
-    Log("ToughnessFeast: ready — Hunger / Toughness / medical panel show heal time");
+    Log("ToughnessFeast: ready — hover Hunger for the feast journal");
 }
