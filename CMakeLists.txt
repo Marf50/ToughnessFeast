@@ -11,7 +11,7 @@
 # =============================================================================
 
 cmake_minimum_required(VERSION 3.20)
-project(ToughnessFeast VERSION 1.1.0 LANGUAGES CXX)
+project(ToughnessFeast VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -115,6 +115,10 @@ if(_GAME_BUILD)
 
   target_link_directories(ToughnessFeast PRIVATE "${KENSHI_LIB_DIR}")
   target_link_libraries(ToughnessFeast PRIVATE KenshiLib)
+  if(EXISTS "${KENSHI_LIB_DIR}/MyGUIEngine_x64.lib")
+    target_link_libraries(ToughnessFeast PRIVATE MyGUIEngine_x64)
+    message(STATUS "Linking MyGUIEngine_x64 (inventory Feast button)")
+  endif()
   message(STATUS "Linking KenshiLib from ${KENSHI_LIB_DIR} (${_libsize} bytes)")
 
 else()

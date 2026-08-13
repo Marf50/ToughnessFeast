@@ -49,6 +49,14 @@
 #include <kenshi/GameData.h>
 #include <kenshi/util/StringPair.h>
 #include <kenshi/util/lektor.h>
+#include <kenshi/gui/InventoryGUI.h>
+#include <mygui/MyGUI_Gui.h>
+#include <mygui/MyGUI_Widget.h>
+#include <mygui/MyGUI_Button.h>
+#include <mygui/MyGUI_TextBox.h>
+#include <mygui/MyGUI_Window.h>
+#include <mygui/MyGUI_InputManager.h>
+#include <mygui/MyGUI_Align.h>
 #endif
 
 #include <cstdint>
@@ -56,6 +64,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <cstdarg>
 #include <string>
 
 #ifndef MAX_PATH
@@ -119,6 +128,7 @@ struct Config
     int   tooltipMaxLines;
     int   enablePanelUi;          // medical tab + character info lines
     int   enableToughTip;         // extra lines on Toughness hover
+    int   enableInvMenu;          // Feast button on the inventory / limbs window
 };
 
 static Config g_cfg = {
@@ -131,8 +141,8 @@ static Config g_cfg = {
     0.28f, 0.55f, 8.0f, 18.0f,    // stumpHunger, restoreHunger, stumpKO, restoreKO
     0.20f,                        // past100 xp
     0.88f, 0.90f, 0.92f, 0.90f,   // weak limb combat mults
-    20,                           // tooltip lines
-    0, 0                          // panel UI OFF (crashes), toughness tip OFF
+    22,                           // tooltip lines
+    0, 0, 1                       // panel UI OFF, toughness tip OFF, inv menu ON
 };
 
 static char g_pluginDir[MAX_PATH] = {};
@@ -270,6 +280,8 @@ static void LoadConfig()
             g_cfg.enablePanelUi = bval();
         else if (!std::strcmp(key, "EnableToughnessTooltip") || !std::strcmp(key, "EnableToughTip"))
             g_cfg.enableToughTip = bval();
+        else if (!std::strcmp(key, "EnableInventoryMenu") || !std::strcmp(key, "EnableInvMenu"))
+            g_cfg.enableInvMenu = bval();
     }
     std::fclose(f);
 
@@ -2535,16 +2547,15 @@ static void GameStrSet(GameStr* s, const char* text)
     std::memset(s, 0, sizeof(*s));
     if (!text) text = "";
     size_t n = std::strlen(text);
-    if (n > 120) n = 120;
+    if (n > 900) n = 900;
     if (n < 16)
     {
         std::memcpy(s->u.sso, text, n);
         s->size = n;
         s->cap = 15;
     }
-    else
+    else if (n <= 120)
     {
-        // ring buffer for longer lines (heap-layout MSVC2010 string)
         static char pool[40][128];
         static int pi = 0;
         char* slot = pool[pi++ % 40];
@@ -2553,6 +2564,17 @@ static void GameStrSet(GameStr* s, const char* text)
         s->u.ptr = slot;
         s->size = n;
         s->cap = 127;
+    }
+    else
+    {
+        static char lpool[4][960];
+        static int li = 0;
+        char* slot = lpool[li++ % 4];
+        std::memcpy(slot, text, n);
+        slot[n] = 0;
+        s->u.ptr = slot;
+        s->size = n;
+        s->cap = 959;
     }
 }
 
@@ -2628,6 +2650,64 @@ static void StripOldFeastBlock(lektor<StringPair>* dats)
         }
     }
 #endif
+}
+
+static void FormatJournalText(CharStats* stats, char* out, int outsz)
+{
+    if (!out || outsz < 8) return;
+    out[0] = 0;
+    if (!stats) { std::snprintf(out, (size_t)outsz, "no character"); return; }
+
+    float tough = GetToughness(stats);
+    int tInt = (int)(tough + 0.5f);
+    if (tInt < 0) tInt = 0;
+    float power = FeastPower(stats);
+    float unlock = UnlockFor(stats);
+    RaceKind rk = DetectRace(stats);
+    MedicalSystem* med = MedFromStats(stats);
+    float hungerRaw = MedHunger(med);
+    float feedShow = HungerFill01(hungerRaw);
+    int limbsOk = CanRegrowLimbsAtHunger(hungerRaw);
+
+    char* p = out;
+    int left = outsz;
+    auto add = [&](const char* fmt, ...) {
+        if (left < 8) return;
+        va_list ap;
+        va_start(ap, fmt);
+        int n = std::vsnprintf(p, (size_t)left, fmt, ap);
+        va_end(ap);
+        if (n < 0) return;
+        if (n >= left) n = left - 1;
+        p += n;
+        left -= n;
+    };
+
+    add("%s   toughness %d\n", RaceName(rk), tInt);
+    add("Food  %.0f / %.0f\n", HungerAsPoints(hungerRaw), HungerFullBar());
+    if (rk == RACE_ROBOT)
+    {
+        add("Skeletons cannot feast\n");
+        return;
+    }
+    if (power <= 0.f)
+        add("LOCKED  need toughness %.0f\n", unlock);
+    else if (!limbsOk)
+        add("Wounds heal. Limbs need food >%.0f\n", g_cfg.limbMinHunger);
+    else
+        add("ON   heal speed %.0f%% of full\n", feedShow * 100.f);
+
+    LimbInfo limbs[8];
+    int n = CollectLimbs(stats, limbs, 8);
+    for (int i = 0; i < n; ++i)
+    {
+        if (limbs[i].detail[0])
+            add("%s   %s  %s\n", limbs[i].name, limbs[i].stage, limbs[i].detail);
+        else
+            add("%s   %s\n", limbs[i].name, limbs[i].stage);
+    }
+    if (n <= 0) add("(could not read body)\n");
+    add("\nLimbs only grow above %.0f food.", g_cfg.limbMinHunger);
 }
 
 static void AppendFeastJournal(lektor<StringPair>* dats, CharStats* stats)
@@ -2960,6 +3040,346 @@ static bool hook_statTip(CharStats* self, const void* statName, int stat, lektor
 #endif
 
 // ---------------------------------------------------------------------------
+// Inventory Feast button + panel (child of the existing inventory window)
+// Click poll — no MyGUI delegates (those crash across CRT).
+// createWidgetT / setCaptionWithReplacing use GameStr (MSVC2010 strings).
+// ---------------------------------------------------------------------------
+
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+
+static int g_invMenuDead = 0;
+
+struct InvMenu
+{
+    InventoryGUI* gui;
+    MyGUI::Widget* win;
+    MyGUI::Widget* btn;
+    MyGUI::Widget* panel;
+    MyGUI::Widget* closeBtn;
+    MyGUI::TextBox* body;
+    int open;
+    int wasDown;
+    unsigned lastPaint;
+};
+static InvMenu g_im = {};
+
+static const std::string& GsRef(GameStr* s)
+{
+    return *reinterpret_cast<const std::string*>(s);
+}
+
+static MyGUI::Widget* TfCreate(MyGUI::Widget* parent, const char* type, const char* skin,
+                               int x, int y, int w, int h, const char* name)
+{
+    if (!parent) return nullptr;
+    MyGUI::Widget* out = nullptr;
+    GameStr t, sk, nm;
+    GameStrSet(&t, type);
+    GameStrSet(&sk, skin);
+    GameStrSet(&nm, name);
+    MyGUI::IntCoord c(x, y, w, h);
+    TF_SEH_TRY
+    {
+        out = parent->createWidgetT(GsRef(&t), GsRef(&sk), c, MyGUI::Align::Default, GsRef(&nm));
+    }
+    TF_SEH_EXCEPT { out = nullptr; }
+    return out;
+}
+
+static void TfCaption(MyGUI::Widget* w, const char* text)
+{
+    if (!w || !text) return;
+    GameStr s;
+    GameStrSet(&s, text);
+    TF_SEH_TRY
+    {
+        MyGUI::TextBox* tb = w->castType<MyGUI::TextBox>(false);
+        if (tb) tb->setCaptionWithReplacing(GsRef(&s));
+    }
+    TF_SEH_EXCEPT { }
+}
+
+static CharStats* StatsFromInv(InventoryGUI* gui)
+{
+    if (!gui) return nullptr;
+    Character* me = nullptr;
+    TF_SEH_TRY { me = gui->getCallbackCharacter(); }
+    TF_SEH_EXCEPT { me = nullptr; }
+    if (!me || !IsPlayerSide(me)) return nullptr;
+    CharStats* st = nullptr;
+    TF_SEH_TRY { st = me->getStats(); }
+    TF_SEH_EXCEPT { st = nullptr; }
+    return st;
+}
+
+static void DestroyInvMenu()
+{
+    TF_SEH_TRY
+    {
+        if (g_im.panel) { g_im.panel->setVisible(false); }
+        if (g_im.btn)   { g_im.btn->setVisible(false); }
+    }
+    TF_SEH_EXCEPT { }
+    std::memset(&g_im, 0, sizeof(g_im));
+}
+
+static int EnsureInvButton(InventoryGUI* gui)
+{
+    if (g_invMenuDead || !g_cfg.enableInvMenu || !gui) return 0;
+    MyGUI::Widget* win = nullptr;
+    TF_SEH_TRY { win = gui->win; }
+    TF_SEH_EXCEPT { win = nullptr; }
+    if (!win) return 0;
+
+    if (g_im.gui == gui && g_im.win == win && g_im.btn)
+    {
+        TF_SEH_TRY { g_im.btn->setVisible(true); }
+        TF_SEH_EXCEPT { DestroyInvMenu(); return 0; }
+        return 1;
+    }
+
+    DestroyInvMenu();
+    g_im.gui = gui;
+    g_im.win = win;
+
+    static const char* kBtnSkins[] = { "Button", "Kenshi_Button", "ButtonEmpty", "Kenshi_SmallButton" };
+    for (int i = 0; i < 4 && !g_im.btn; ++i)
+        g_im.btn = TfCreate(win, "Button", kBtnSkins[i], 8, 4, 78, 22, "TF_FeastBtn");
+    if (!g_im.btn)
+    {
+        LogErr("ToughnessFeast: inventory Feast button create failed");
+        g_invMenuDead = 1;
+        return 0;
+    }
+    TfCaption(g_im.btn, "Feast");
+    TF_SEH_TRY { g_im.btn->setVisible(true); }
+    TF_SEH_EXCEPT { }
+    Log("ToughnessFeast: inventory Feast button ready");
+    return 1;
+}
+
+static void PaintInvPanel()
+{
+    if (!g_im.body || !g_im.open) return;
+    CharStats* st = StatsFromInv(g_im.gui);
+    char buf[960];
+    FormatJournalText(st, buf, (int)sizeof(buf));
+    TfCaption(g_im.body, buf);
+}
+
+static void OpenInvPanel(int on)
+{
+    if (g_invMenuDead || !g_im.win) return;
+    if (on && !g_im.panel)
+    {
+        static const char* kPanelSkins[] = { "Panel", "WindowCS", "Kenshi_Window", "PanelEmpty", "WhiteSkin" };
+        for (int i = 0; i < 5 && !g_im.panel; ++i)
+            g_im.panel = TfCreate(g_im.win, "Widget", kPanelSkins[i], 8, 30, 300, 280, "TF_FeastPanel");
+        if (!g_im.panel)
+        {
+            LogErr("ToughnessFeast: feast panel create failed");
+            return;
+        }
+        g_im.closeBtn = TfCreate(g_im.panel, "Button", "Button", 268, 4, 24, 20, "TF_FeastX");
+        if (g_im.closeBtn) TfCaption(g_im.closeBtn, "X");
+
+        MyGUI::Widget* bodyW = TfCreate(g_im.panel, "TextBox", "TextBox", 8, 28, 284, 244, "TF_FeastBody");
+        if (!bodyW) bodyW = TfCreate(g_im.panel, "EditBox", "EditBox", 8, 28, 284, 244, "TF_FeastBody");
+        if (bodyW)
+        {
+            TF_SEH_TRY { g_im.body = bodyW->castType<MyGUI::TextBox>(false); }
+            TF_SEH_EXCEPT { g_im.body = nullptr; }
+        }
+    }
+    g_im.open = on ? 1 : 0;
+    if (g_im.panel)
+    {
+        TF_SEH_TRY { g_im.panel->setVisible(on ? true : false); }
+        TF_SEH_EXCEPT { }
+    }
+    if (on) PaintInvPanel();
+}
+
+static int WidgetUnderMouse(MyGUI::Widget* w)
+{
+    if (!w) return 0;
+    MyGUI::InputManager* im = nullptr;
+    TF_SEH_TRY { im = MyGUI::InputManager::getInstancePtr(); }
+    TF_SEH_EXCEPT { im = nullptr; }
+    if (!im) return 0;
+    MyGUI::Widget* focus = nullptr;
+    TF_SEH_TRY { focus = im->getMouseFocusWidget(); }
+    TF_SEH_EXCEPT { focus = nullptr; }
+    if (!focus) return 0;
+    if (focus == w) return 1;
+    // child of button/panel counts
+    TF_SEH_TRY
+    {
+        MyGUI::Widget* p = focus;
+        for (int i = 0; i < 6 && p; ++i)
+        {
+            if (p == w) return 1;
+            p = p->getParent();
+        }
+    }
+    TF_SEH_EXCEPT { }
+    return 0;
+}
+
+static int MouseLeftDown()
+{
+    MyGUI::InputManager* im = nullptr;
+    TF_SEH_TRY { im = MyGUI::InputManager::getInstancePtr(); }
+    TF_SEH_EXCEPT { im = nullptr; }
+    if (!im) return 0;
+    int down = 0;
+    TF_SEH_TRY { down = im->isButtonPressed(MyGUI::MouseButton::Left) ? 1 : 0; }
+    TF_SEH_EXCEPT { down = 0; }
+    return down;
+}
+
+static void TickInvMenu(InventoryGUI* gui)
+{
+    if (g_invMenuDead || !g_cfg.enableInvMenu || !gui) return;
+    if (!EnsureInvButton(gui)) return;
+
+    int down = MouseLeftDown();
+    int click = (down && !g_im.wasDown) ? 1 : 0;
+    g_im.wasDown = down;
+
+    if (click)
+    {
+        if (WidgetUnderMouse(g_im.closeBtn))
+            OpenInvPanel(0);
+        else if (WidgetUnderMouse(g_im.btn))
+            OpenInvPanel(g_im.open ? 0 : 1);
+    }
+
+    if (g_im.open)
+    {
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+        unsigned now = GetTickCount();
+        if (!g_im.lastPaint || (now - g_im.lastPaint) > 400u)
+        {
+            g_im.lastPaint = now;
+            PaintInvPanel();
+        }
+#endif
+    }
+}
+
+static void (*orig_invShow)(InventoryGUI*, bool) = nullptr;
+static void hook_invShow(InventoryGUI* self, bool on)
+{
+    if (orig_invShow) orig_invShow(self, on);
+    if (!g_cfg.enableInvMenu || g_invMenuDead || !self) return;
+    TF_SEH_TRY
+    {
+        if (on)
+        {
+            if (StatsFromInv(self))
+                EnsureInvButton(self);
+        }
+        else if (g_im.gui == self)
+        {
+            OpenInvPanel(0);
+            if (g_im.btn)
+            {
+                TF_SEH_TRY { g_im.btn->setVisible(false); }
+                TF_SEH_EXCEPT { }
+            }
+        }
+    }
+    TF_SEH_EXCEPT
+    {
+        g_invMenuDead = 1;
+        LogErr("ToughnessFeast: inventory show SEH — inv menu off");
+    }
+}
+
+static void (*orig_invUpdate)(InventoryGUI*) = nullptr;
+static void hook_invUpdate(InventoryGUI* self)
+{
+    if (orig_invUpdate) orig_invUpdate(self);
+    if (!g_cfg.enableInvMenu || g_invMenuDead || !self) return;
+    if (g_im.gui && g_im.gui != self) return;
+    TF_SEH_TRY { TickInvMenu(self); }
+    TF_SEH_EXCEPT
+    {
+        g_invMenuDead = 1;
+        LogErr("ToughnessFeast: inventory update SEH — inv menu off");
+    }
+}
+
+static void (*orig_openLimbs)(InventoryGUI*, MyGUI::Widget*) = nullptr;
+static void hook_openLimbs(InventoryGUI* self, MyGUI::Widget* sender)
+{
+    if (orig_openLimbs) orig_openLimbs(self, sender);
+    if (!g_cfg.enableInvMenu || g_invMenuDead || !self) return;
+    TF_SEH_TRY
+    {
+        if (StatsFromInv(self) && EnsureInvButton(self))
+            OpenInvPanel(1);
+    }
+    TF_SEH_EXCEPT
+    {
+        LogErr("ToughnessFeast: openLimbs SEH");
+    }
+}
+
+static void InstallInvMenuHooks()
+{
+    if (!g_cfg.enableInvMenu)
+    {
+        Log("ToughnessFeast: inventory Feast menu OFF");
+        return;
+    }
+    HMODULE exe = GetModuleHandleA(nullptr);
+    if (!exe) exe = GetModuleHandleA("kenshi_x64.exe");
+    if (!exe) { LogErr("ToughnessFeast: no exe for inv hooks"); return; }
+
+    void* showA = (void*)((unsigned char*)exe + 0x70C3D0);
+    void* updA  = (void*)((unsigned char*)exe + 0x712640);
+    void* limbA = (void*)((unsigned char*)exe + 0x70BF70);
+
+    TF_SEH_TRY
+    {
+        intptr_t a = KenshiLib::GetRealAddress(&InventoryGUI::show);
+        if (a) showA = (void*)a;
+    }
+    TF_SEH_EXCEPT { }
+    TF_SEH_TRY
+    {
+        intptr_t a = KenshiLib::GetRealAddress(&InventoryGUI::update);
+        if (a) updA = (void*)a;
+    }
+    TF_SEH_EXCEPT { }
+    TF_SEH_TRY
+    {
+        intptr_t a = KenshiLib::GetRealAddress(&InventoryGUI::openLimbsInterface);
+        if (a) limbA = (void*)a;
+    }
+    TF_SEH_EXCEPT { }
+
+    if (KenshiLib::SUCCESS == KenshiLib::AddHook(showA, (void*)hook_invShow, (void**)&orig_invShow))
+        Log("ToughnessFeast: inventory show (Feast button)");
+    else
+        LogErr("ToughnessFeast: inventory show hook failed");
+
+    if (KenshiLib::SUCCESS == KenshiLib::AddHook(updA, (void*)hook_invUpdate, (void**)&orig_invUpdate))
+        Log("ToughnessFeast: inventory update (Feast click)");
+    else
+        LogErr("ToughnessFeast: inventory update hook failed");
+
+    if (KenshiLib::SUCCESS == KenshiLib::AddHook(limbA, (void*)hook_openLimbs, (void**)&orig_openLimbs))
+        Log("ToughnessFeast: limbs button opens Feast panel");
+    else
+        LogErr("ToughnessFeast: openLimbsInterface hook failed");
+}
+
+#endif // !LINUX_IDE
+
+// ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
 
@@ -3065,6 +3485,10 @@ static void InstallHooks()
     }
 
     Log("ToughnessFeast: MedicalSystem::load not hooked (v1.0.1 crash site)");
+
+#if !defined(TOUGHNESSFEAST_LINUX_IDE)
+    InstallInvMenuHooks();
+#endif
 #endif
 
     if (g_cfg.enableMedical)
